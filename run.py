@@ -50,6 +50,18 @@ def _common_args(p):
                    help='learnable per-channel affine on sum_pool output (cheap residual-stat matching)')
     p.add_argument('--token_shift',     type=int, default=0,
                    help='Fixed causal token shift K: each position sees [x[t-K]..x[t]] (cross-token via local context). The one mechanism (with hybrid/selective) that raises accuracy.')
+    # RDDLGN-inspired recurrent/stateful LGN (alternative cross-token mechanism)
+    p.add_argument('--recurrent',       action='store_true',
+                   help='use a recurrent/stateful LGN layer (state_t = Logic([token_bits_t, state_{t-1}])). Causal; NOT full RDDLGN encoder/decoder.')
+    p.add_argument('--recurrent_layers', type=int, nargs='*', default=[],
+                   help='layer indices to make recurrent (empty = all replaced layers).')
+    p.add_argument('--recurrent_state_width', type=int, default=None,
+                   help='hidden state width (default = token bit width); must divide n_embd.')
+    p.add_argument('--recurrent_depth', type=int, default=1,
+                   help='number of logic sublayers in the recurrent update.')
+    p.add_argument('--recurrent_state_init', type=str, default='zero',
+                   choices=['zero', 'learned', 'residual'],
+                   help='initial hidden state: zero | learned param | residual (from first token bits).')
     # training
     p.add_argument('--baseline_steps',  type=int,   default=5_000)
     p.add_argument('--imitation_steps', type=int,   default=1_000)
@@ -123,6 +135,11 @@ def _build_cfg(args):
         cfg.logic.n_bits     = args.n_bits
     cfg.logic.learn_pool      = args.learn_pool
     cfg.logic.token_shift     = args.token_shift
+    cfg.logic.recurrent             = args.recurrent
+    cfg.logic.recurrent_layers      = args.recurrent_layers
+    cfg.logic.recurrent_state_width = args.recurrent_state_width
+    cfg.logic.recurrent_depth       = args.recurrent_depth
+    cfg.logic.recurrent_state_init  = args.recurrent_state_init
     # training
     cfg.train.baseline_steps   = args.baseline_steps
     cfg.train.imitation_steps  = args.imitation_steps

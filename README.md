@@ -146,8 +146,33 @@ Tikrasis pranašumas realizuojamas **FPGA/ASIC**, kur kiekvienas 2-input vartas 
 
 ---
 
+## Recurrent / stateful LGN (RDDLGN-inspired, eksperimentinis)
+
+Kaip pirmą žingsnį RDDLGN kryptimi, pridėjau **recurrent/stateful LGN sluoksnį** —
+alternatyvą TokenShift'ui. Vietoj fiksuoto kaimynų lango, kiekvienam tokenui logikos
+stack'as atnaujina **paslėptą būseną**:
+
+```
+state_t = Logic([token_bits_t, state_{t-1}])
+out_t   = group_sum(state_t)
+```
+
+Tai causal (output pozicijoje t priklauso tik nuo tokenų ≤ t) ir leidžia logikai maišyti
+informaciją per seką per būseną — būtent to pointwise vartai negali. **Tai NĖRA pilnas
+RDDLGN encoder–decoder** — tik stateful mechanizmas, įgyvendintas kaip drop-in GPT-bloko
+pakaitalas (`RecurrentLogicGateGPTLayer` / `HardRecurrentLogicGateGPTLayer`), suderinamas su
+esamu imitation / fine-tune / scaling pipeline'u.
+
+Paleidimas:
+```bash
+python run.py scale --recurrent --recurrent_layers 0 \
+  --recurrent_state_width 1024 --recurrent_depth 1 --recurrent_state_init zero \
+  --learn_pool --heatmap results/aggressive/heatmap.json --checkpoint results/baseline.pt
+```
+Be `--recurrent` viskas veikia kaip anksčiau (senas kelias nepakitęs).
+
 ## Kryptys toliau
 
-Turiu dar keletą krypčių, bet labiausiai perspektyvi (RDDLGN stateful vartai) reikalauja
-gano didelio visos architektūros pertvarkymo. Dabartinės implementacijos jau ženkliai
+Recurrent sluoksnio accuracy dar nepamatuota — tai sekantis žingsnis (state-width / depth /
+init sweep'ai, ir ar jis pralenkia TokenShift'ą). Dabartinės implementacijos jau ženkliai
 padidina efektyvumą FPGA/ASIC kontekste.

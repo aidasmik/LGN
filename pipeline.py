@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from lgn import (
     LogicGateGPTLayer, HardLogicGateGPTLayer,
     HybridLogicGateGPTLayer, HardHybridLogicGateGPTLayer,
+    RecurrentLogicGateGPTLayer, HardRecurrentLogicGateGPTLayer,
     annealed_temperature
 )
 
@@ -332,6 +333,8 @@ def make_hard_model(soft_model, target_indices, device):
         soft_layer = soft_model.transformer.h[idx]
         if isinstance(soft_layer, HybridLogicGateGPTLayer):
             hard_layer = HardHybridLogicGateGPTLayer(soft_layer).to(device)
+        elif isinstance(soft_layer, RecurrentLogicGateGPTLayer):
+            hard_layer = HardRecurrentLogicGateGPTLayer(soft_layer).to(device)
         else:
             hard_layer = HardLogicGateGPTLayer(soft_layer).to(device)
         hard.replace_layer(idx, hard_layer)
@@ -343,7 +346,7 @@ def make_hard_model(soft_model, target_indices, device):
 # ---------------------------------------------------------------------------
 
 def _build_logic_layer(trained_default, layer_idx, gpt_cfg, logic_cfg):
-    """Construct a LogicGateGPTLayer (or hybrid) for layer_idx with the kept flags."""
+    """Construct a Logic / Hybrid / Recurrent LGN layer for layer_idx with the kept flags."""
     common = dict(
         logic_width=gpt_cfg.n_embd * logic_cfg.width_mult, depth=logic_cfg.depth, k=logic_cfg.k,
         activation=logic_cfg.activation,
@@ -353,6 +356,27 @@ def _build_logic_layer(trained_default, layer_idx, gpt_cfg, logic_cfg):
         sum_pool=logic_cfg.sum_pool, no_in_proj=logic_cfg.no_in_proj,
         learn_pool=logic_cfg.learn_pool, token_shift=logic_cfg.token_shift,
     )
+    # Recurrent layer: enabled when --recurrent and (no recurrent_layers list, or this idx in it).
+    rec = getattr(logic_cfg, 'recurrent', False)
+    rec_idx = getattr(logic_cfg, 'recurrent_layers', []) or []
+    use_rec = rec and (not rec_idx or layer_idx in rec_idx)
+    if use_rec and layer_idx not in logic_cfg.hybrid_layers:
+        print(f'  [recurrent] stateful LGN at L{layer_idx} '
+              f'(state_width={logic_cfg.recurrent_state_width}, depth={logic_cfg.recurrent_depth}, '
+              f'init={logic_cfg.recurrent_state_init})')
+        return RecurrentLogicGateGPTLayer(
+            gpt_cfg, layer_idx,
+            logic_width=common['logic_width'], depth=logic_cfg.depth, k=logic_cfg.k,
+            activation=logic_cfg.activation,
+            conn_init_scale=logic_cfg.conn_init_scale, gate_init_scale=logic_cfg.gate_init_scale,
+            identity_logic=logic_cfg.identity_logic,
+            binary_io=logic_cfg.binary_io, n_bits=logic_cfg.n_bits,
+            sum_pool=logic_cfg.sum_pool, no_in_proj=logic_cfg.no_in_proj,
+            learn_pool=logic_cfg.learn_pool,
+            state_width=logic_cfg.recurrent_state_width,
+            recurrent_depth=logic_cfg.recurrent_depth,
+            state_init=logic_cfg.recurrent_state_init,
+        )
     if layer_idx in logic_cfg.hybrid_layers:
         print(f'  [hybrid] keeping original attention sublayer for L{layer_idx}, logic replaces MLP only')
         return HybridLogicGateGPTLayer(
@@ -451,7 +475,8 @@ def _enable_lgn_grads(layer):
 
 def _logic_indices(model):
     return [i for i, b in enumerate(model.transformer.h)
-            if isinstance(b, (LogicGateGPTLayer, HybridLogicGateGPTLayer))]
+            if isinstance(b, (LogicGateGPTLayer, HybridLogicGateGPTLayer,
+                              RecurrentLogicGateGPTLayer))]
 
 
 def _add_logic_layer(model, layer_idx, gpt_cfg, logic_cfg, device, trained_default=None):

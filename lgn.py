@@ -38,6 +38,13 @@ class LogicConfig:
     # receptive field for the pointwise LGN. K=0 disables. (The single mechanism, with
     # hybrid/selective, that actually raises accuracy.)
     token_shift: int = 0
+    # RDDLGN-inspired recurrent/stateful LGN (alternative cross-token mechanism to token_shift).
+    # state_t = Logic([token_bits_t, state_{t-1}]). Causal. NOT full RDDLGN encoder/decoder.
+    recurrent: bool = False
+    recurrent_layers: list = field(default_factory=list)  # empty = all replaced layers; else only these idx
+    recurrent_state_width: int = None                     # None = token bit width; must divide n_embd
+    recurrent_depth: int = 1
+    recurrent_state_init: str = "zero"                    # 'zero' | 'learned' | 'residual'
 
 @dataclass
 class TrainConfig:
@@ -510,6 +517,204 @@ class HardLogicGateGPTLayer(nn.Module):
         for l in self.logic:
             h = l(h)
         return x + self.dropout(self._aggregate(h, B, T))
+
+
+# ---------------------------------------------------------------------------
+# Recurrent / stateful LGN layer (RDDLGN-inspired, NOT full encoder-decoder RDDLGN)
+# ---------------------------------------------------------------------------
+
+class RecurrentLogicGateGPTLayer(nn.Module):
+    """Stateful logic block. Per token, a logic stack updates a hidden state from the
+    current token's bits and the previous state:
+
+        state_t = Logic([token_bits_t, state_{t-1}])
+        out_t   = group_sum(state_t)            # aggregate state_width -> C
+
+    Causal by construction: out_t depends only on tokens <= t. This is the RDDLGN idea
+    (give the gates internal state so logic can mix across the sequence) applied as a
+    drop-in GPT-block replacement — NOT a full RDDLGN encoder/decoder rewrite.
+    """
+    def __init__(self, gpt_cfg, layer_idx, logic_width=None, depth=1, k=4, seed=1000,
+                 activation='sigmoid', conn_init_scale=0.02, gate_init_scale=0.02,
+                 identity_logic=False, binary_io=True, n_bits=8, sum_pool=True,
+                 no_in_proj=True, learn_pool=False,
+                 state_width=None, recurrent_depth=1, state_init='zero'):
+        super().__init__()
+        C = gpt_cfg.n_embd
+        self.C = C
+        self.layer_idx = layer_idx
+        self.logic_width = logic_width or C * 4
+        self.activation = activation
+        assert binary_io, "recurrent layer requires binary_io"
+        self.binary_io = True
+        self.n_bits = n_bits
+        self.no_in_proj = no_in_proj
+        self.learn_pool = learn_pool
+        self.state_init = state_init
+        # token feature width fed into the logic stack (before binarization)
+        token_feat = C if no_in_proj else self.logic_width
+        self.token_bw = token_feat * n_bits
+        # hidden state width (default = token bit width); must divide C for group-sum
+        self.state_width = state_width if state_width is not None else self.token_bw
+        assert self.state_width % C == 0, (
+            f"recurrent_state_width ({self.state_width}) must be divisible by n_embd ({C}).")
+        self.group_size = self.state_width // C
+        self.recurrent_depth = recurrent_depth
+        self.norm = nn.LayerNorm(C)
+        if not no_in_proj:
+            self.in_proj = nn.Linear(C, self.logic_width)
+        # logic stack: first layer reads [token_bits, state], the rest read state only
+        layers = []
+        for i in range(recurrent_depth):
+            in_dim = (self.token_bw + self.state_width) if i == 0 else self.state_width
+            layers.append(LearnedLogicLayer(
+                in_dim, self.state_width, k=k, seed=seed + layer_idx * 100 + 50 + i,
+                conn_init_scale=conn_init_scale, gate_init_scale=gate_init_scale,
+                identity=identity_logic))
+        self.logic = nn.ModuleList(layers)
+        if learn_pool:
+            self.pool_scale = nn.Parameter(torch.full((C,), 2.0 / self.group_size))
+            self.pool_shift = nn.Parameter(torch.full((C,), -1.0))
+        if state_init == 'learned':
+            self.initial_state = nn.Parameter(torch.zeros(self.state_width))
+        self.dropout = nn.Dropout(gpt_cfg.dropout)
+        self.use_ste = False
+
+    # --- API shared with LogicGateGPTLayer ---
+    def set_temperature(self, t):
+        for l in self.logic: l.set_temperature(t)
+
+    def set_backward_temp(self, t):
+        for l in self.logic: l.set_backward_temp(t)
+
+    @torch.no_grad()
+    def commitment(self):
+        if not self.logic:
+            return 1.0
+        return sum(l.commitment() for l in self.logic) / len(self.logic)
+
+    def entropy_loss(self, conn_w=0.001, gate_w=0.005):
+        return sum(l.entropy_loss(conn_w, gate_w) for l in self.logic)
+
+    @torch.no_grad()
+    def sharpness(self):
+        stats = [l.sharpness() for l in self.logic]
+        return {k: sum(s[k] for s in stats) / len(stats) for k in ['conn_a', 'conn_b', 'gate']}
+
+    # --- forward machinery ---
+    def _token_bits(self, x, training):
+        h = self.norm(x)
+        if not self.no_in_proj:
+            h = self.in_proj(h)
+        h = _apply_activation(h, self.activation)
+        if self.n_bits > 1:
+            return _thermometer_ste(h, self.n_bits, training)
+        return _binarize_ste(h) if training else (h > 0.5).to(dtype=h.dtype)
+
+    def _init_state(self, B, token_bits, device, dtype):
+        if self.state_init == 'zero':
+            return torch.zeros(B, self.state_width, device=device, dtype=dtype)
+        if self.state_init == 'learned':
+            return self.initial_state.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1)
+        if self.state_init == 'residual':
+            first = token_bits[:, 0]                                  # (B, token_bw)
+            if self.token_bw >= self.state_width:
+                return first[:, :self.state_width]
+            pad = torch.zeros(B, self.state_width - self.token_bw, device=device, dtype=dtype)
+            return torch.cat([first, pad], dim=-1)
+        raise ValueError(f"unknown state_init '{self.state_init}'")
+
+    def _aggregate_state(self, state, B):
+        grp = state.view(B, self.C, self.group_size)
+        if self.learn_pool:
+            return grp.sum(dim=-1) * self.pool_scale + self.pool_shift
+        return (grp.sum(dim=-1) - self.group_size / 2) / (self.group_size / 2)   # (B, C)
+
+    def _run(self, x, hard, ste, training):
+        B, T, C = x.shape
+        token_bits = self._token_bits(x, training)                   # (B, T, token_bw)
+        state = self._init_state(B, token_bits, x.device, x.dtype)
+        outs = []
+        for t in range(T):                                           # causal: only past/current
+            z = torch.cat([token_bits[:, t], state], dim=-1)
+            s = self.logic[0](z, hard=hard, ste=ste)
+            for l in self.logic[1:]:
+                s = l(s, hard=hard, ste=ste)
+            state = s
+            outs.append(self._aggregate_state(state, B))
+        return torch.stack(outs, dim=1)                              # (B, T, C)
+
+    def forward(self, x, hard=False):
+        ste = self.use_ste and not hard
+        return x + self.dropout(self._run(x, hard, ste, self.training))
+
+
+class HardRecurrentLogicGateGPTLayer(nn.Module):
+    """Hard-snapped mirror of RecurrentLogicGateGPTLayer (discrete gates)."""
+    def __init__(self, soft: RecurrentLogicGateGPTLayer):
+        super().__init__()
+        self.layer_idx  = soft.layer_idx
+        self.activation = soft.activation
+        self.n_bits     = soft.n_bits
+        self.no_in_proj = soft.no_in_proj
+        self.learn_pool = soft.learn_pool
+        self.state_init = soft.state_init
+        self.C          = soft.C
+        self.token_bw   = soft.token_bw
+        self.state_width = soft.state_width
+        self.group_size = soft.group_size
+        self.norm = copy.deepcopy(soft.norm)
+        if not self.no_in_proj:
+            self.in_proj = copy.deepcopy(soft.in_proj)
+        if self.learn_pool:
+            self.register_buffer('pool_scale', soft.pool_scale.detach().clone())
+            self.register_buffer('pool_shift', soft.pool_shift.detach().clone())
+        if self.state_init == 'learned':
+            self.register_buffer('initial_state', soft.initial_state.detach().clone())
+        self.dropout = copy.deepcopy(soft.dropout)
+        self.logic = nn.ModuleList([HardLogicLayer(l) for l in soft.logic])
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def _token_bits(self, x):
+        h = self.norm(x)
+        if not self.no_in_proj:
+            h = self.in_proj(h)
+        h = _apply_activation(h, self.activation)
+        if self.n_bits > 1:
+            return _thermometer_ste(h, self.n_bits, training=False)
+        return (h > 0.5).to(dtype=h.dtype)
+
+    def _init_state(self, B, token_bits, device, dtype):
+        if self.state_init == 'zero':
+            return torch.zeros(B, self.state_width, device=device, dtype=dtype)
+        if self.state_init == 'learned':
+            return self.initial_state.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1)
+        first = token_bits[:, 0]
+        if self.token_bw >= self.state_width:
+            return first[:, :self.state_width]
+        pad = torch.zeros(B, self.state_width - self.token_bw, device=device, dtype=dtype)
+        return torch.cat([first, pad], dim=-1)
+
+    def _aggregate_state(self, state, B):
+        grp = state.view(B, self.C, self.group_size)
+        if self.learn_pool:
+            return grp.sum(dim=-1) * self.pool_scale + self.pool_shift
+        return (grp.sum(dim=-1) - self.group_size / 2) / (self.group_size / 2)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        token_bits = self._token_bits(x)
+        state = self._init_state(B, token_bits, x.device, x.dtype)
+        outs = []
+        for t in range(T):
+            z = torch.cat([token_bits[:, t], state], dim=-1)
+            s = self.logic[0](z)
+            for l in self.logic[1:]:
+                s = l(s)
+            state = s
+            outs.append(self._aggregate_state(state, B))
+        return x + self.dropout(torch.stack(outs, dim=1))
 
 
 # ---------------------------------------------------------------------------
