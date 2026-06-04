@@ -171,6 +171,34 @@ python run.py scale --recurrent --recurrent_layers 0 \
 ```
 Be `--recurrent` viskas veikia kaip anksčiau (senas kelias nepakitęs).
 
+### Gated (flip-flop / latch-inspired) būsenos atnaujinimas
+
+Paprastas (vanilla) recurrent kiekviename žingsnyje **visą būseną perrašo** iš naujo
+(`state_t = Logic([token_bits_t, state_{t-1}])`). Tai ir yra viena iš priežasčių, kodėl jis
+atsilieka: nėra mechanizmo *išlaikyti* būsenos bitą per ilgesnę seką — informacija greitai
+prarandama. Kaip pasirenkamą (opt-in) plėtinį pridėjau **gated** atnaujinimą, įkvėptą
+flip-flop / latch logikos: be kandidato dar mokomas atskiras **keep** loginis vartų stack'as,
+kuris sprendžia, ar laikyti seną bitą, ar perrašyti nauju:
+
+```
+candidate_t = LogicCandidate([token_bits_t, state_{t-1}])
+keep_t      = LogicKeep([token_bits_t, state_{t-1}])
+state_t     = keep_t * state_{t-1} + (1 - keep_t) * candidate_t   # soft
+state_t     = where(keep_t, state_{t-1}, candidate_t)             # hard
+```
+
+`keep=1` palieka seną būsenos bitą, `keep=0` perrašo kandidatu. Svarbu: **keep vartas pats
+yra mokomas LOGIKOS stack'as** (`LearnedLogicLayer`), ne sigmoid/dense gate'as — taip visas
+mechanizmas lieka Boolean ir hard-snap'inamas (`HardGatedRecurrentLogicGateGPTLayer`).
+
+Tai **flip-flop/latch-INSPIRED plėtinys, o ne teiginys, kad RDDLGN paper'is naudojo
+GRU-stiliaus keep vartą.** Paleidimas (`--recurrent_gated` reikalauja `--recurrent`):
+```bash
+python run.py scale --recurrent --recurrent_gated --recurrent_layers 0 \
+  --recurrent_state_width 1024 --recurrent_state_init zero \
+  --learn_pool --heatmap results/aggressive/heatmap.json --checkpoint results/baseline.pt
+```
+
 ## Kryptys toliau
 
 Recurrent sluoksnio accuracy dar nepamatuota — tai sekantis žingsnis (state-width / depth /

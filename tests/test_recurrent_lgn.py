@@ -4,7 +4,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from lgn import (ExperimentConfig, ModelConfig, DataConfig, make_gpt,
-                 RecurrentLogicGateGPTLayer, HardRecurrentLogicGateGPTLayer)
+                 RecurrentLogicGateGPTLayer, HardRecurrentLogicGateGPTLayer,
+                 GatedRecurrentLogicGateGPTLayer, HardGatedRecurrentLogicGateGPTLayer)
 
 
 def _gpt_cfg():
@@ -12,12 +13,16 @@ def _gpt_cfg():
     return GPTConfig(block_size=8, vocab_size=32, n_layer=2, n_head=4, n_embd=16, dropout=0.0)
 
 
-def _make_layer(state_width=64, depth=1, state_init='zero', seed=0):
+def _make_layer(state_width=64, depth=1, state_init='zero', seed=0, cls=RecurrentLogicGateGPTLayer):
     torch.manual_seed(seed)
     g = _gpt_cfg()
-    return RecurrentLogicGateGPTLayer(
+    return cls(
         g, layer_idx=0, binary_io=True, n_bits=4, no_in_proj=True, sum_pool=True,
         learn_pool=True, state_width=state_width, recurrent_depth=depth, state_init=state_init)
+
+
+def _make_gated(state_width=64, depth=1, state_init='zero', seed=0):
+    return _make_layer(state_width, depth, state_init, seed, cls=GatedRecurrentLogicGateGPTLayer)
 
 
 def test_recurrent_is_causal():
@@ -66,6 +71,77 @@ def test_depth2_and_state_width():
     assert torch.allclose(layer(x, hard=True), hard(x), atol=1e-6)
 
 
+# ---------------------------------------------------------------------------
+# Gated (flip-flop / latch-inspired) recurrent LGN
+# ---------------------------------------------------------------------------
+
+def test_gated_is_causal():
+    layer = _make_gated().eval()
+    B, T, C = 2, 8, 16
+    x = torch.randn(B, T, C)
+    t = 4
+    y1 = layer(x)
+    x2 = x.clone()
+    x2[:, t + 1:] = torch.randn(B, T - (t + 1), C)
+    y2 = layer(x2)
+    assert torch.allclose(y1[:, :t + 1], y2[:, :t + 1], atol=1e-6), "gated output depends on future!"
+
+
+def test_gated_soft_hard_equivalence():
+    for init in ('zero', 'learned', 'residual'):
+        for depth in (1, 2):
+            layer = _make_gated(state_width=32, depth=depth, state_init=init, seed=3).eval()
+            if init == 'learned':
+                with torch.no_grad():
+                    layer.initial_state.normal_()
+            x = torch.randn(2, 8, 16)
+            y_soft_hard = layer(x, hard=True)
+            hard = HardGatedRecurrentLogicGateGPTLayer(layer).eval()
+            y_hard = hard(x)
+            assert torch.allclose(y_soft_hard, y_hard, atol=1e-6), \
+                f"gated soft(hard=True) != hard for init={init}, depth={depth}"
+
+
+def test_gated_gradient_flow():
+    """Both the candidate (self.logic) AND keep (self.keep_logic) stacks must get gradients."""
+    layer = _make_gated(depth=2).train()
+    x = torch.randn(2, 8, 16)
+    layer(x).pow(2).mean().backward()
+    for stack_name in ('logic', 'keep_logic'):
+        stack = getattr(layer, stack_name)
+        for li, g in enumerate(stack):
+            for name in ('conn_logits_a', 'conn_logits_b', 'gate_logits'):
+                p = getattr(g, name)
+                assert p.grad is not None and p.grad.abs().sum() > 0, \
+                    f"no gradient on {stack_name}[{li}].{name}"
+
+
+def test_gated_pipeline_construction():
+    """recurrent + recurrent_gated -> GatedRecurrentLogicGateGPTLayer; hard conversion -> Hard variant."""
+    from pipeline import _build_logic_layer, make_hard_model
+
+    cfg = ExperimentConfig()
+    cfg.model = ModelConfig(n_layer=2, n_head=4, n_embd=16, dropout=0.0)
+    cfg.data = DataConfig(block_size=8, vocab_size=32)
+    cfg.logic.learn_pool = True
+    cfg.logic.recurrent = True
+    cfg.logic.recurrent_gated = True
+    cfg.logic.recurrent_state_width = 32
+
+    base, gpt_cfg = make_gpt(cfg.model, cfg.data, 'cpu')
+    layer = _build_logic_layer(base, 0, gpt_cfg, cfg.logic)
+    assert isinstance(layer, GatedRecurrentLogicGateGPTLayer)
+    base.replace_layer(0, layer)
+    hard = make_hard_model(base, [0], 'cpu')
+    assert isinstance(hard.transformer.h[0], HardGatedRecurrentLogicGateGPTLayer)
+    # vanilla path (gated off) must still give the plain recurrent layer
+    cfg.logic.recurrent_gated = False
+    base2, gpt_cfg2 = make_gpt(cfg.model, cfg.data, 'cpu')
+    layer2 = _build_logic_layer(base2, 0, gpt_cfg2, cfg.logic)
+    assert isinstance(layer2, RecurrentLogicGateGPTLayer)
+    assert not isinstance(layer2, GatedRecurrentLogicGateGPTLayer)
+
+
 def test_pipeline_heatmap_and_scale_recurrent():
     from pipeline import WikiText2, run_heatmap, run_scaling
 
@@ -109,5 +185,9 @@ if __name__ == '__main__':
     test_soft_hard_equivalence(); print('soft-hard OK')
     test_gradient_flow(); print('grad OK')
     test_depth2_and_state_width(); print('depth2/state_width OK')
+    test_gated_is_causal(); print('gated causal OK')
+    test_gated_soft_hard_equivalence(); print('gated soft-hard OK')
+    test_gated_gradient_flow(); print('gated grad OK')
+    test_gated_pipeline_construction(); print('gated pipeline OK')
     test_pipeline_heatmap_and_scale_recurrent(); print('pipeline OK')
     print('ALL RECURRENT TESTS PASSED')

@@ -11,6 +11,7 @@ from lgn import (
     LogicGateGPTLayer, HardLogicGateGPTLayer,
     HybridLogicGateGPTLayer, HardHybridLogicGateGPTLayer,
     RecurrentLogicGateGPTLayer, HardRecurrentLogicGateGPTLayer,
+    GatedRecurrentLogicGateGPTLayer, HardGatedRecurrentLogicGateGPTLayer,
     annealed_temperature
 )
 
@@ -333,6 +334,9 @@ def make_hard_model(soft_model, target_indices, device):
         soft_layer = soft_model.transformer.h[idx]
         if isinstance(soft_layer, HybridLogicGateGPTLayer):
             hard_layer = HardHybridLogicGateGPTLayer(soft_layer).to(device)
+        elif isinstance(soft_layer, GatedRecurrentLogicGateGPTLayer):
+            # check gated BEFORE vanilla recurrent (gated is a subclass of it)
+            hard_layer = HardGatedRecurrentLogicGateGPTLayer(soft_layer).to(device)
         elif isinstance(soft_layer, RecurrentLogicGateGPTLayer):
             hard_layer = HardRecurrentLogicGateGPTLayer(soft_layer).to(device)
         else:
@@ -360,11 +364,18 @@ def _build_logic_layer(trained_default, layer_idx, gpt_cfg, logic_cfg):
     rec = getattr(logic_cfg, 'recurrent', False)
     rec_idx = getattr(logic_cfg, 'recurrent_layers', []) or []
     use_rec = rec and (not rec_idx or layer_idx in rec_idx)
+    gated = getattr(logic_cfg, 'recurrent_gated', False)
+    # Precedence: hybrid wins over recurrent (documented). A layer listed as hybrid keeps its
+    # frozen attention and uses the plain MLP-replacement logic layer, never the recurrent path.
     if use_rec and layer_idx not in logic_cfg.hybrid_layers:
-        print(f'  [recurrent] stateful LGN at L{layer_idx} '
+        if logic_cfg.token_shift:
+            print(f'  [warn] token_shift={logic_cfg.token_shift} is IGNORED for the recurrent '
+                  f'layer at L{layer_idx} (the recurrent state is the cross-token mechanism).')
+        rec_cls = GatedRecurrentLogicGateGPTLayer if gated else RecurrentLogicGateGPTLayer
+        print(f'  [recurrent{"/gated" if gated else ""}] stateful LGN at L{layer_idx} '
               f'(state_width={logic_cfg.recurrent_state_width}, depth={logic_cfg.recurrent_depth}, '
               f'init={logic_cfg.recurrent_state_init})')
-        return RecurrentLogicGateGPTLayer(
+        return rec_cls(
             gpt_cfg, layer_idx,
             logic_width=common['logic_width'], depth=logic_cfg.depth, k=logic_cfg.k,
             activation=logic_cfg.activation,
@@ -476,7 +487,8 @@ def _enable_lgn_grads(layer):
 def _logic_indices(model):
     return [i for i, b in enumerate(model.transformer.h)
             if isinstance(b, (LogicGateGPTLayer, HybridLogicGateGPTLayer,
-                              RecurrentLogicGateGPTLayer))]
+                              RecurrentLogicGateGPTLayer,
+                              GatedRecurrentLogicGateGPTLayer))]
 
 
 def _add_logic_layer(model, layer_idx, gpt_cfg, logic_cfg, device, trained_default=None):

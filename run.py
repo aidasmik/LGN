@@ -62,6 +62,9 @@ def _common_args(p):
     p.add_argument('--recurrent_state_init', type=str, default='zero',
                    choices=['zero', 'learned', 'residual'],
                    help='initial hidden state: zero | learned param | residual (from first token bits).')
+    p.add_argument('--recurrent_gated', action='store_true',
+                   help='flip-flop/latch-inspired gated update (requires --recurrent): '
+                        'state = keep*state + (1-keep)*candidate, where keep is a learned LOGIC gate.')
     # training
     p.add_argument('--baseline_steps',  type=int,   default=5_000)
     p.add_argument('--imitation_steps', type=int,   default=1_000)
@@ -140,6 +143,10 @@ def _build_cfg(args):
     cfg.logic.recurrent_state_width = args.recurrent_state_width
     cfg.logic.recurrent_depth       = args.recurrent_depth
     cfg.logic.recurrent_state_init  = args.recurrent_state_init
+    cfg.logic.recurrent_gated       = args.recurrent_gated
+    if args.recurrent_gated and not args.recurrent:
+        raise ValueError("--recurrent_gated requires --recurrent (the gated update is a "
+                         "variant of the recurrent layer). Pass --recurrent --recurrent_gated.")
     # training
     cfg.train.baseline_steps   = args.baseline_steps
     cfg.train.imitation_steps  = args.imitation_steps

@@ -45,6 +45,10 @@ class LogicConfig:
     recurrent_state_width: int = None                     # None = token bit width; must divide n_embd
     recurrent_depth: int = 1
     recurrent_state_init: str = "zero"                    # 'zero' | 'learned' | 'residual'
+    # Opt-in flip-flop/latch-inspired gated update (requires recurrent=True):
+    #   candidate = LogicCandidate([token_bits, state]); keep = LogicKeep([token_bits, state])
+    #   state = keep*state + (1-keep)*candidate  (keep is itself a learned LOGIC stack).
+    recurrent_gated: bool = False
 
 @dataclass
 class TrainConfig:
@@ -545,8 +549,17 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         self.layer_idx = layer_idx
         self.logic_width = logic_width or C * 4
         self.activation = activation
-        assert binary_io, "recurrent layer requires binary_io"
+        # Guardrails: fail early & clearly on configs the recurrent layer cannot honour.
+        if not binary_io:
+            raise ValueError("recurrent LGN requires binary_io=True (logic operates on bits).")
+        if not sum_pool:
+            raise ValueError("recurrent LGN currently only supports sum_pool aggregation; "
+                             "pass sum_pool=True (group-sum of the state).")
+        if state_init not in ('zero', 'learned', 'residual'):
+            raise ValueError(f"unknown recurrent_state_init '{state_init}' "
+                             "(expected 'zero' | 'learned' | 'residual').")
         self.binary_io = True
+        self.sum_pool = True
         self.n_bits = n_bits
         self.no_in_proj = no_in_proj
         self.learn_pool = learn_pool
@@ -556,8 +569,9 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         self.token_bw = token_feat * n_bits
         # hidden state width (default = token bit width); must divide C for group-sum
         self.state_width = state_width if state_width is not None else self.token_bw
-        assert self.state_width % C == 0, (
-            f"recurrent_state_width ({self.state_width}) must be divisible by n_embd ({C}).")
+        if self.state_width % C != 0:
+            raise ValueError(
+                f"recurrent_state_width ({self.state_width}) must be divisible by n_embd ({C}).")
         self.group_size = self.state_width // C
         self.recurrent_depth = recurrent_depth
         self.norm = nn.LayerNorm(C)
@@ -690,11 +704,13 @@ class HardRecurrentLogicGateGPTLayer(nn.Module):
             return torch.zeros(B, self.state_width, device=device, dtype=dtype)
         if self.state_init == 'learned':
             return self.initial_state.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1)
-        first = token_bits[:, 0]
-        if self.token_bw >= self.state_width:
-            return first[:, :self.state_width]
-        pad = torch.zeros(B, self.state_width - self.token_bw, device=device, dtype=dtype)
-        return torch.cat([first, pad], dim=-1)
+        if self.state_init == 'residual':
+            first = token_bits[:, 0]
+            if self.token_bw >= self.state_width:
+                return first[:, :self.state_width]
+            pad = torch.zeros(B, self.state_width - self.token_bw, device=device, dtype=dtype)
+            return torch.cat([first, pad], dim=-1)
+        raise ValueError(f"unknown state_init '{self.state_init}'")
 
     def _aggregate_state(self, state, B):
         grp = state.view(B, self.C, self.group_size)
@@ -713,6 +729,100 @@ class HardRecurrentLogicGateGPTLayer(nn.Module):
             for l in self.logic[1:]:
                 s = l(s)
             state = s
+            outs.append(self._aggregate_state(state, B))
+        return x + self.dropout(torch.stack(outs, dim=1))
+
+
+# ---------------------------------------------------------------------------
+# Gated recurrent LGN: flip-flop / latch-style state retention (opt-in).
+#   candidate_t = LogicCandidate([token_bits_t, state_{t-1}])
+#   keep_t      = LogicKeep([token_bits_t, state_{t-1}])
+#   state_t     = keep_t * state_{t-1} + (1 - keep_t) * candidate_t   (soft)
+#   state_t     = where(keep_t, state_{t-1}, candidate_t)             (hard)
+# The keep gate is itself a learned LOGIC stack (not a sigmoid/dense gate). This is an
+# extension inspired by flip-flop/latch state retention; the original RDDLGN paper does
+# NOT claim a GRU-style keep gate.
+# ---------------------------------------------------------------------------
+
+class GatedRecurrentLogicGateGPTLayer(RecurrentLogicGateGPTLayer):
+    """Recurrent LGN with a logic-based keep/overwrite gate (opt-in extension)."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gated = True
+        # `self.logic` (from the parent) is the CANDIDATE stack. Build a same-shape KEEP stack.
+        keep = []
+        for i, cand_layer in enumerate(self.logic):
+            keep.append(LearnedLogicLayer(
+                cand_layer.in_dim, cand_layer.out_dim, k=cand_layer.k,
+                seed=1234 + self.layer_idx * 100 + 70 + i))
+        self.keep_logic = nn.ModuleList(keep)
+
+    # --- API: iterate BOTH candidate (self.logic) and keep stacks ---
+    def _all(self):
+        return list(self.logic) + list(self.keep_logic)
+
+    def set_temperature(self, t):
+        for l in self._all(): l.set_temperature(t)
+
+    def set_backward_temp(self, t):
+        for l in self._all(): l.set_backward_temp(t)
+
+    @torch.no_grad()
+    def commitment(self):
+        ls = self._all()
+        return sum(l.commitment() for l in ls) / len(ls)
+
+    def entropy_loss(self, conn_w=0.001, gate_w=0.005):
+        return sum(l.entropy_loss(conn_w, gate_w) for l in self._all())
+
+    @torch.no_grad()
+    def sharpness(self):
+        stats = [l.sharpness() for l in self._all()]
+        return {k: sum(s[k] for s in stats) / len(stats) for k in ['conn_a', 'conn_b', 'gate']}
+
+    def _run(self, x, hard, ste, training):
+        B, T, C = x.shape
+        token_bits = self._token_bits(x, training)
+        state = self._init_state(B, token_bits, x.device, x.dtype)
+        outs = []
+        for t in range(T):
+            z = torch.cat([token_bits[:, t], state], dim=-1)
+            cand = self.logic[0](z, hard=hard, ste=ste)
+            for l in self.logic[1:]:
+                cand = l(cand, hard=hard, ste=ste)
+            keep = self.keep_logic[0](z, hard=hard, ste=ste)
+            for l in self.keep_logic[1:]:
+                keep = l(keep, hard=hard, ste=ste)
+            if hard:
+                state = torch.where(keep > 0.5, state, cand)
+            else:
+                state = keep * state + (1.0 - keep) * cand   # keep in {0,1} under STE
+            outs.append(self._aggregate_state(state, B))
+        return torch.stack(outs, dim=1)
+
+
+class HardGatedRecurrentLogicGateGPTLayer(HardRecurrentLogicGateGPTLayer):
+    """Hard-snapped mirror of GatedRecurrentLogicGateGPTLayer."""
+    def __init__(self, soft: GatedRecurrentLogicGateGPTLayer):
+        super().__init__(soft)                                   # sets up norm/in_proj/pool/init + candidate self.logic
+        self.keep_logic = nn.ModuleList([HardLogicLayer(l) for l in soft.keep_logic])
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        B, T, C = x.shape
+        token_bits = self._token_bits(x)
+        state = self._init_state(B, token_bits, x.device, x.dtype)
+        outs = []
+        for t in range(T):
+            z = torch.cat([token_bits[:, t], state], dim=-1)
+            cand = self.logic[0](z)
+            for l in self.logic[1:]:
+                cand = l(cand)
+            keep = self.keep_logic[0](z)
+            for l in self.keep_logic[1:]:
+                keep = l(keep)
+            state = torch.where(keep > 0.5, state, cand)
             outs.append(self._aggregate_state(state, B))
         return x + self.dropout(torch.stack(outs, dim=1))
 
