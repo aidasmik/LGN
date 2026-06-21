@@ -1,18 +1,12 @@
-# LGN-Nano: Logic Gate Networks transformerio sluoksniuose
-
-Projektas tiria, kiek transformerio (nanoGPT) galima pakeisti diferencijuojamais **Logic Gate Networks (LGN)** - tinklais iš mokomų Boolean vartų (AND, XOR ir t.t.) vietoj float matricų daugybų. Motyvacija - efektyvumas: LGN natūraliai mapinasi į hardware (vienas vartas = 1 FPGA LUT), tad jei jie sugeba atlikti transformerio darbą, gaunama didelė nauda inference greičio ir energijos prasme. Setup'as visur tas pats - nanoGPT (12 sluoksnių x 128d x 4 heads), byte-level WikiText-2. Metrika - next-byte top-1 accuracy ant fiksuoto val batch'o; LGN visada matuojamas kaip **hard** (diskretus) modelis, kaip realiame inference.
-
-Šis etapas sutelktas į vieną kryptį - LGN kaip **FFN replacement**, paliekant attention. Tikslas izoliuoti per-token darbą: attention užšaldomas visuose 12 sluoksnių, o į LGN keičiamas tik FFN. Taip galima grynai įvertinti, kiek gerai LGN atlieka FFN darbą, kai attention idealus. Baseline buvo tik 35.4% acc (transformerio 54.87%), o po optimizacijos pasiekta 48.18%, arba 88% transformerio. Svarbiausia - tas pats pagerinimas išsilaikė ir variante be attention (token shift): 43.54%, arba 80% transformerio.
-
 ## Modelių apžvalga
 
 ![bendras palyginimas](results/figs/report/fig1_headline.png)
 
 | Modelis | Accuracy % | % transf. | Ką keičia |
 |---|---:|---:|---|
-| NanoGPT transformeris | **54.87** | 100 | 12 sluoksnių baseline (lubos) |
+| NanoGPT transformeris | **54.87** | 100 | 12 sluoksnių baseline |
 | **Attention + LGN-FFN (optimized)** | **48.18** | 88 | užšaldytas attention visur, FFN i LGN, optimizuoti gates |
-| **Pure LGN (token shift)** | **43.54** | 80 | jokio attention; token-shift + tie patys optimizuoti gates |
+| **Pure LGN (token shift)** | **43.54** | 80 | no attention; token-shift + tie patys optimizuoti gates |
 | Baseline LGN-FFN | 35.35 | 64 | FFN i LGN be optimizacijų |
 | Identity gates | 26.46 | 48 | logika išjungta (kontrolė) |
 | Tik attention (be FFN) | 5.46 | 10 | grindys |
@@ -29,7 +23,7 @@ Daugiausiai padeda **gate count output'e**. sum_pool nuskaito grupę gates į vi
 
 Kitas dalykas - **gate arity (LUT-K)**. 2-input gate yra silpniausias įmanomas vartas (16 funkcijų iš dviejų bitų). Vietoj jo naudojamas k-input LUT gate: mokoma 2^K-įrašų truth table, soft treniruojant įvertinama per multilinear extension, hard'e snap'inasi į vieną FPGA LUT-K. Ant L0 LUT4 prilygsta maždaug 2x daugiau 2-input gates, LUT6 maždaug 2.7x; visame modelyje efektas kuklesnis (apie +0.9 pp), nes nauda susikoncentruoja sunkiuose sluoksniuose.
 
-Kodėl būtent L0 ir paskutiniai: pakeitus po vieną FFN aiškiai matosi, kurie sluoksniai sunkesni - L0 sunkiausias (apie 6x už bet kurį kitą), vidurio FFN (L1-L6) beveik nemokami (juos pakeitus val loss net pagerėja), o pabaiga (ypač L11) vėl sunkesnė.
+Pakeitus po vieną FFN aiškiai matosi, kurie sluoksniai sunkesni - L0 sunkiausias (apie 6x už bet kurį kitą), vidurio FFN (L1-L6) beveik nemokami (juos pakeitus val loss net pagerėja), o pabaiga (ypač L11) vėl sunkesnė.
 
 ![sluoksnių sunkumas](results/figs/report/fig6_per_layer.png)
 
@@ -39,13 +33,12 @@ Viskas suvedama nuosekliai: pirma kiekvienas LGN sluoksnis warm-startinamas imit
 
 ## Ablation testas
 
-Su tiek aplinkinių komponentų (ln, pooling, residual, užšaldytas attention) lengva apsigauti, kad pagerinimą duoda jie, o ne pati logika. Todėl visa aplinka paliekama, bet gates išjungiami (identity) - toks variantas pasiekia tik 26.5%, vadinasi LGN realiai prideda **+21.7 pp**. Darbą atlieka gates, ne pooling ar residual.
 
 ![ablation](results/figs/report/fig3_honesty.png)
 
 ## Pure LGN su token shift
 
-Svarbu patikrinti, ar šie pagerinimai veikia tik su attention, ar ir be jo. Be attention cross-token sprendžiamas pigiai - token-shift'u (prie kiekvienos pozicijos pridedamos kelios praėjusios, jokių mokomų parametrų). Su token-shift vietoj attention tas pats optimizuotas LGN pasiekia 43.54%, arba 80% transformerio. Tai rodo, kad pagerintas pats FFN-pakaitalas, o ne pasinaudota attention'u.
+e attention cross-token sprendžiamas pigiai - token-shift'u (prie kiekvienos pozicijos pridedamos kelios praėjusios, jokių mokomų parametrų). Su token-shift vietoj attention tas pats optimizuotas LGN pasiekia 43.54%, arba 80% transformerio. Tai rodo, kad pagerintas pats FFN-pakaitalas, o ne pasinaudota attention'u.
 
 ## Palyginimas su ankstesniais aproachais
 
@@ -81,7 +74,7 @@ Seed-check vertė geriausiai matosi su gate ensemble: iš pradžių atrodė kaip
 
 ## Efektyvumas
 
-Grynas LGN (be attention) gerokai efektyvesnis - pure LGN variantas pasiekia 80% transformerio acc su maždaug 2.5x mažiau params (2.45 M -> apie 0.96 M) ir maždaug 10x mažiau FLOPs. Su attention variantu acc aukštesnis (88%), bet efficiency naudos nėra (attention dominuoja compute).
+Grynas LGN (be attention) gerokai efektyvesnis - pure LGN variantas pasiekia 80% transformerio acc su maždaug 2.5x mažiau params (2.45 M -> apie 0.96 M) ir maždaug 10x mažiau FLOPs. Su attention variantu acc aukštesnis (88%), bet efficiency naudos nėra.
 ![efektyvumas](results/figs/report_en/05_efficiency.png)
 
 ## Apibendrinimas
