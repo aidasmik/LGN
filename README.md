@@ -49,17 +49,16 @@ Svarbiausias patikrinimas — ar svertai veikia tik su realiu attention, ar pers
 
 ## Palyginimas su ankstesniais aproachais
 
-Ankstesnėje fazėje (prieš šią gate-optimizaciją) geriausi grynesni variantai siekė ~36–39%. Optimizacija juos aiškiai pajudino:
+Ankstesnėje fazėje LGN kaip FFN treniravau **be jokio attention** (grynas variantas), o cross-token spręsdavau token-shift'u. Dabartinė gate-optimizacija tą patį grynąjį kelią aiškiai pajudino:
 
-| Aproachas | Acc % (anksčiau) | Acc % (optimizuotas) |
+| Grynas LGN (be attention) | Acc % (anksčiau) | Acc % (po optimizacijos) |
 |---|---:|---:|
-| Pure LGN + token-shift (K=2) | 36.22 | **43.54** |
-| Grynas LGN, be cross-token (aggressive) | 27.22 | — |
-| Hybrid L0 (tik L0 attention) | 33.5 | — |
-| Selective (4 transformer + 8 LGN) | 39.01 | — |
-| Attention + LGN-FFN (visi attention frozen) | — | **48.18** |
+| be cross-token (aggressive) | 27.22 | — |
+| token-shift K=2 | 36.22 | **43.54** |
 
-Tiesioginis palyginimas — tas pats token-shift pure LGN: **36.22 → 43.54 (+7.3 pp)** vien iš gate-optimizacijos, nieko nepridėjus prie cross-token dalies. Dar įdomiau, kad optimizuotas pure LGN (43.54, visai be transformer sluoksnių) dabar pralenkia ankstesnį selective variantą (39.01), kuris dar laikė **4 pilnus transformer sluoksnius**. Naujasis attention + LGN-FFN setup'as (48.18) lubas pakelia dar aukščiau, nes užšaldo attention ne tik L0, o visuose 12 sluoksnių.
+Tiesioginis palyginimas — tas pats token-shift pure LGN: **36.22 → 43.54 (+7.3 pp)** vien iš gate-optimizacijos, nieko nepridėjus prie cross-token dalies. Tas pats optimizuotas grynas LGN (43.54, visai be attention) net pralenkia ankstesnius variantus, kurie dar laikydavo dalį transformerio — Hybrid L0 (33.5, paliktas tik L0 attention) ir Selective (39.01, palikti 4 pilni transformer sluoksniai).
+
+O attention + LGN-FFN setup'as (48.18) yra atskiras isolation eksperimentas: jame attention užšaldau ne tik L0, o visuose 12 sluoksnių, kad švariai išmatuočiau patį FFN→LGN darbą. Būtent ten suoptimizuotos gate'ų idėjos ir persikėlė atgal į grynąjį (be attention) variantą.
 
 ## Kaip testavau kitus pasiūlymus
 
