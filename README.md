@@ -47,6 +47,20 @@ Su tiek aplinkinių komponentų (ln, pooling, residual, užšaldytas attention) 
 
 Svarbiausias patikrinimas — ar svertai veikia tik su realiu attention, ar persikelia ir be jo. Cross-token tada sprendžiu pigiai token-shift'u (prie kiekvienos pozicijos pridedu kelias praėjusias, jokių mokomų parametrų). Įdėjus tą patį optimizuotą LGN su token-shift vietoj attention, acc nukrito tik iki 43.54%, arba 80% transformerio. Tai, kad optimizacija išsilaikė ir be attention, rodo, jog pagerinau būtent FFN-pakaitalą, o ne pasinaudojau attention'u.
 
+## Palyginimas su ankstesniais aproachais
+
+Ankstesnėje fazėje (prieš šią gate-optimizaciją) geriausi grynesni variantai siekė ~36–39%. Optimizacija juos aiškiai pajudino:
+
+| Aproachas | Acc % (anksčiau) | Acc % (optimizuotas) |
+|---|---:|---:|
+| Pure LGN + token-shift (K=2) | 36.22 | **43.54** |
+| Grynas LGN, be cross-token (aggressive) | 27.22 | — |
+| Hybrid L0 (tik L0 attention) | 33.5 | — |
+| Selective (4 transformer + 8 LGN) | 39.01 | — |
+| Attention + LGN-FFN (visi attention frozen) | — | **48.18** |
+
+Tiesioginis palyginimas — tas pats token-shift pure LGN: **36.22 → 43.54 (+7.3 pp)** vien iš gate-optimizacijos, nieko nepridėjus prie cross-token dalies. Dar įdomiau, kad optimizuotas pure LGN (43.54, visai be transformer sluoksnių) dabar pralenkia ankstesnį selective variantą (39.01), kuris dar laikė **4 pilnus transformer sluoksnius**. Naujasis attention + LGN-FFN setup'as (48.18) lubas pakelia dar aukščiau, nes užšaldo attention ne tik L0, o visuose 12 sluoksnių.
+
 ## Kaip testavau kitus pasiūlymus
 
 Lygiagrečiai išbandžiau ir kitus pasiūlymus — Conv1D, LloydMax binarizer ir TopK block-sparse interconnect. Pilnas run'as (visi 12 sluoksnių, greedy scaling) trunka 12+ valandų, tad testavau efektyviai ir su griežtomis kontrolėmis, kad nieko nepaskelbčiau per anksti: paleidžiu tik ant L0 (sunkiausio sluoksnio, kur efektas turėtų būti ryškiausias, nors L0 linkęs gain'us perdėti); kiekvienam darau ablation control — užšaldau pačius gates ir žiūriu, ar improvement'ą duoda LGN ar pats priedas; o jei kažkas atrodo geriau, pakartoju su kitu seed, kad atskirčiau realų pagerinimą nuo triukšmo.
