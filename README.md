@@ -66,7 +66,7 @@ Lygiagrečiai išbandyti ir kiti pasiūlymai - Conv1D, LloydMax binarizer ir Top
 
 ![patikrinti priedai](results/figs/report/fig4_screen.png)
 
-Nė vienas priedas patikimai nepralenkė baseline'o - dėl tos pačios priežasties: visi taiko ne į modelio capacity, o į encoding, readout ar interconnect, t.y. ne į tą dimensiją, kuri yra bottleneck.
+Nė vienas priedas patikimai nepralenkė baseline'o - dėl tos pačios priežasties: visi taiko ne į modelio capacity, o į encoding, readout ar interconnect.
 
 | Bandymas | Rezultatas | Kodėl |
 |---|---|---|
@@ -75,14 +75,13 @@ Nė vienas priedas patikimai nepralenkė baseline'o - dėl tos pačios priežast
 | TopK block-sparse interconnect | blogiau | prastesnis nei paprastas random gate candidate parinkimas |
 | Gate ensemble | triukšmas | tariamas gain'as apsivertė vos pakeitus seed |
 
-Seed-check vertė geriausiai matosi su gate ensemble: iš pradžių atrodė kaip realus pagerinimas (-0.013), bet su kitu seed ženklas apsivertė (+0.009). Be seed-kontrolės tai būtų pasirodę kaip realus rezultatas.
+Seed-check vertė geriausiai matosi su gate ensemble: iš pradžių atrodė kaip (-0.013), bet su kitu seed ženklas apsivertė (+0.009)
 
 ![seed-check](results/figs/report/fig5_ensemble_noise.png)
 
 ## Efektyvumas
 
-Grynas LGN (be attention) gerokai efektyvesnis - pure LGN variantas pasiekia 80% transformerio acc su maždaug 2.5x mažiau params (2.45 M -> apie 0.96 M) ir maždaug 10x mažiau FLOPs. Su attention variantu acc aukštesnis (88%), bet efficiency naudos nėra (attention dominuoja compute). Realių hardware skaičių nėra - ant GPU LGN visada lėtesnis, nes GPU optimizuotas tankiai matricų daugybai; pranašumas realizuojamas FPGA/ASIC, kur vartas = LUT.
-
+Grynas LGN (be attention) gerokai efektyvesnis - pure LGN variantas pasiekia 80% transformerio acc su maždaug 2.5x mažiau params (2.45 M -> apie 0.96 M) ir maždaug 10x mažiau FLOPs. Su attention variantu acc aukštesnis (88%), bet efficiency naudos nėra (attention dominuoja compute).
 ![efektyvumas](results/figs/report_en/05_efficiency.png)
 
 ## Apibendrinimas
