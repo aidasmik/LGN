@@ -12,129 +12,63 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as _ckpt
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 @dataclass
 class LogicConfig:
-    # Width of the trained Linear path (only used when no_in_proj=False; no-op in aggressive).
     width_mult: int = 2
     depth: int = 1
     k: int = 4
     activation: str = 'sigmoid'
     conn_init_scale: float = 0.02
     gate_init_scale: float = 0.02
-    hybrid_layers: list = field(default_factory=list)  # layers that keep frozen attention
-    # How the pre-MLP norm (ln_2) is handled in hybrid layers:
-    #   'fresh'          -> new LayerNorm trained from scratch (legacy default, preserves old results)
-    #   'copy_trainable' -> copy trained ln_2, allow fine-tuning (faithful input + cheap recalibration)
-    #   'copy_frozen'    -> copy trained ln_2 and freeze (strict "only the MLP function changed")
+    hybrid_layers: list = field(default_factory=list)
     hybrid_ln2: str = 'fresh'
-    identity_logic: bool = False                        # ablation: LGN body = pass-through
-    # Per-channel binary calibration: replace the squashing activation with a learned
-    # sigmoid(scale*x + bias) per feature channel before thermometer encoding. Init to
-    # identity-vs-sigmoid (scale=1, bias=0). Tiny (2 params/channel); a dense map is a
-    # SEPARATE ablation, not this. Helps map ~Gaussian post-norm activations into bits.
+    identity_logic: bool = False
     learn_binary_calibration: bool = False
-    # Signed real->binary encoding: sign bit + positive-magnitude thermometer + negative-
-    # magnitude thermometer (2*n_bits+1 bits/scalar). Keeps sign+magnitude of zero-centered
-    # post-norm activations instead of squashing to [0,1]. Mutually exclusive with calibration.
     signed_encoding: bool = False
 
-    # AGGRESSIVE SETUP (the honest default — no trained float transform around the gates)
     binary_io: bool = True
     n_bits: int = 8
-    # Per-layer adaptive precision: layers in `precision_layers` use `high_n_bits` instead of
-    # `n_bits`. Input-quantization degradation scales ~1/n_bits, but only the sensitive layers
-    # (L0/L9/L10/L11) are quantization-limited — so spend bits there, stay cheap in the middle.
     precision_layers: list = field(default_factory=list)
     high_n_bits: int = 16
-    # Output-side resolution: widen the final logic layer by out_gate_mult so each output
-    # channel sums out_gate_mult x more gates (a finer sum_pool readout). Decouples output
-    # resolution from input n_bits (in aggressive mode group_size == n_bits, conflating them).
     out_gate_mult: int = 1
-    # Per-layer override of out_gate_mult, e.g. {0: 8, 11: 4}. Unlisted layers use the global.
     out_gate_mult_layers: dict = field(default_factory=dict)
-    # Gate primitive arity: 0/2 = the 2-input gate (16-function LUT2); >=3 = a K-input LUT gate
-    # (learned 2^K truth table via multilinear extension; hard-snaps to one FPGA LUT-K). Tests
-    # whether a more expressive primitive beats more 2-input gates at equal gate count.
     lut_k: int = 0
-    # Per-layer override of lut_k, e.g. {0: 6, 11: 6}. Unlisted layers use the global.
     lut_k_layers: dict = field(default_factory=dict)
-    # Functional init (hybrid layers): seed the first logic layer's candidate connections from the
-    # trained MLP's input importance (||W1[:,c]||) instead of a blind random lottery.
     mlp_guided_init: bool = False
-    # Honesty control: freeze the logic parameters (connections + gate/LUT tables) at their
-    # RANDOM init; only the plumbing (ln_2, pool affine, calibration) trains. Shape-compatible
-    # with any out_gate_mult/lut_k, unlike identity_logic. The trained-vs-frozen gap = the
-    # accuracy genuinely earned by LEARNED logic.
     freeze_logic: bool = False
-    # A1: residual/DAG wiring for depth>=2 -- deeper gate layers draw candidates from BOTH the
-    # previous layer's outputs AND the original input bits (wires are free in hardware). Fixes
-    # the error-compounding that made naive depth hurt; gives FFN-like 2-layer composition.
     logic_residual: bool = False
-    # A2: gated LUT pairs -- each output = LUT_a(x) AND LUT_b(x) (soft: product). A 2K-input
-    # function class at 2x LUT cost; mimics the FFN's multiplicative gating. Requires lut_k>=2.
     gated_lut: bool = False
-    # Gradient checkpointing on the logic stack: recompute the (memory-heavy, esp. LUT-K)
-    # logic forward during backward instead of storing it. ~2x logic compute, big memory cut,
-    # so large gates run at full batch_size instead of a noisy reduced batch.
     grad_checkpoint: bool = False
-    # Learned multi-level aggregation: replace the equal-weight bit COUNT with a per-channel
-    # learned weight per bit-in-group: out[c] = sum_i w[c,i]*bit[c,i] + b[c]. Same gates, but
-    # up to 2^group_size output levels instead of group_size+1. Block-diagonal (own group only,
-    # no channel mixing) -> bit_width params, NOT a dense out_proj. Init == learn_pool (no-op).
     weighted_pool: bool = False
     sum_pool: bool = True
     no_in_proj: bool = True
-    # Learnable per-channel affine on the sum_pool output (cheap residual-stat matching).
     learn_pool: bool = False
-    # Fixed causal token shift: each position sees [x[t-K]..x[t]] — a local cross-token
-    # receptive field for the pointwise LGN. K=0 disables. (The single mechanism, with
-    # hybrid/selective, that actually raises accuracy.)
     token_shift: int = 0
-    # Optional causal Conv1D adapters around the LGN body. Off by default because trainable
-    # float convs can become "fake LGN" plumbing unless checked with freeze_logic controls.
     pre_conv1d: bool = False
-    pre_conv1d_channels: int = 0       # 0 = keep current token_shift width
+    pre_conv1d_channels: int = 0
     pre_conv1d_kernel: int = 3
     pre_conv1d_stride: int = 1
     pre_conv1d_groups: int = 1
     post_conv1d: bool = False
-    post_conv1d_channels: int = 0      # 0 = n_embd; != n_embd gets a 1x1 return projection
+    post_conv1d_channels: int = 0
     post_conv1d_kernel: int = 3
     post_conv1d_stride: int = 1
     post_conv1d_groups: int = 1
-    # Real->bits encoder. 'activation' is the historical sigmoid/thermometer path.
-    # 'lloydmax' thresholds raw pre-LGN activations with Gaussian Lloyd-Max thresholds
-    # whose mean/std are tracked from the actual activation distribution.
     binary_encoder: str = 'activation'
     lloyd_ema: float = 0.99
     lloyd_min_std: float = 1e-3
-    # Optional sparse trainable interconnect for gate input selection. 'random' is the
-    # historical candidate-softmax lottery; 'topk_block_sparse' ports the block-topk idea.
     interconnect: str = 'random'
     topk_sparse_k: int = 8
     topk_sparse_scale: float = 1.0
-    # #2 learned per-channel nonlinear readout: map the group bit-count through a per-channel
-    # learned curve (interp knots), init linear so default == sum_pool. Requires sum_pool.
     pool_curve: bool = False
-    # #4 residual gate scaling: per-channel learned alpha on the LGN contribution (x+alpha*LGN).
     residual_scale: bool = False
-    # #5 within-layer ensembling: N independent depth-1 gate banks, averaged (variance
-    # reduction over the candidate lottery). ensemble=1 == current. Requires depth==1.
     ensemble: int = 1
-    # RDDLGN-inspired recurrent/stateful LGN (alternative cross-token mechanism to token_shift).
-    # state_t = Logic([token_bits_t, state_{t-1}]). Causal. NOT full RDDLGN encoder/decoder.
     recurrent: bool = False
-    recurrent_layers: list = field(default_factory=list)  # empty = all replaced layers; else only these idx
-    recurrent_state_width: int = None                     # None = token bit width; must divide n_embd
+    recurrent_layers: list = field(default_factory=list)
+    recurrent_state_width: int = None
     recurrent_depth: int = 1
-    recurrent_state_init: str = "zero"                    # 'zero' | 'learned' | 'residual'
-    # Opt-in flip-flop/latch-inspired gated update (requires recurrent=True):
-    #   candidate = LogicCandidate([token_bits, state]); keep = LogicKeep([token_bits, state])
-    #   state = keep*state + (1-keep)*candidate  (keep is itself a learned LOGIC stack).
+    recurrent_state_init: str = "zero"
     recurrent_gated: bool = False
 
 @dataclass
@@ -154,37 +88,19 @@ class TrainConfig:
     finetune_lr: float = 2e-3
     ft_ent_conn: float = 0.0005
     ft_ent_gate: float = 0.01
-    per_layer_anneal: bool = False  # scale imitation steps by layer difficulty
-    ft_log_sharpness: bool = True   # print per-layer sharpness
-    ft_eval_hard: bool = False      # evaluate hard-snapped model
-    # B4: keep the BEST-hard checkpoint seen during fine-tune (eval every 500 steps) instead
-    # of the final step. The deployed model is the hard one, so select by hard validation.
+    per_layer_anneal: bool = False
+    ft_log_sharpness: bool = True
+    ft_eval_hard: bool = False
     ft_keep_best_hard: bool = False
     imit_loss: str = 'mse'
-    ste: bool = False               # straight-through estimator (forward hard, backward soft)
-    # CAGE — Align Forward Adapt Backward (2026, arxiv 2603.14157).
-    # Implies STE (hard forward) and adapts the BACKWARD-pass softmax temperature τ_b
-    # based on an EMA of average commitment confidence. Closes the discretization gap
-    # by construction (forward = inference). Schedule: τ_b in [tau_min, tau_max] linearly
-    # interpolated by EMA confidence c_ema (1/K-1.0 -> tau_max-tau_min).
+    ste: bool = False
     cage: bool = False
     cage_tau_max: float = 3.0
     cage_tau_min: float = 0.5
     cage_ema:     float = 0.99
-    # Direct (from-scratch) training: anneal temperature DURING fine-tune on LM loss
-    # instead of during imitation. Lets the LGN learn its own solution, not imitate MLP.
     anneal_in_finetune: bool = False
-    # Curriculum: decaying MSE-to-MLP term blended into fine-tune (weight*1.0 -> 0).
-    # 0 = pure LM loss. Single-layer fine-tune only (heatmap).
     ft_imit_weight: float = 0.0
-    # NOTE: 'freeze_unreplaced' was removed — the base model is ALWAYS frozen by
-    # _make_logic_model / _add_logic_layer (only LGN layer params get requires_grad=True),
-    # so the flag was redundant. All degradation numbers are already 'pure LGN' measurements.
-    # Joint polish: after sequential scaling, fine-tune ALL LGN layers together to
-    # coordinate them (fixes greedy myopia). 0 = disabled.
     joint_polish_steps: int = 0
-    # System-level distillation during joint polish: KL of student logits to the
-    # original transformer's logits. Global coordination signal (vs per-layer MLP). 0 = LM only.
     joint_polish_kl_weight: float = 0.0
 
 @dataclass
@@ -210,9 +126,6 @@ class ExperimentConfig:
     results_dir: str = "results"
     seed: int = 1337
 
-# ---------------------------------------------------------------------------
-# nanoGPT wrappers
-# ---------------------------------------------------------------------------
 
 NANOGPT_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', 'nanogpt_layer_lab', 'nanoGPT')
@@ -283,9 +196,9 @@ class CausalConv1D(nn.Module):
         B, T, C = x.shape
         if C != self.in_channels:
             raise ValueError(f"CausalConv1D expected {self.in_channels} channels, got {C}.")
-        y = x.transpose(1, 2)                              # (B,C,T)
-        y = F.pad(y, (self.kernel_size - 1, 0))            # causal left padding
-        y = self.conv(y).transpose(1, 2)                   # (B,T',Cout)
+        y = x.transpose(1, 2)
+        y = F.pad(y, (self.kernel_size - 1, 0))
+        y = self.conv(y).transpose(1, 2)
         if self.stride > 1:
             y = y.repeat_interleave(self.stride, dim=1)
         if y.size(1) < T:
@@ -370,8 +283,6 @@ class TopKBlockSparseInterconnect(nn.Module):
             with torch.no_grad():
                 nn.init.normal_(self.c_sparse, mean=0.0, std=0.01)
                 idx = torch.randint(self.topk, (self.n_blocks, self.outputs_per_block), generator=g)
-                # Keep the Dirac bias trainable: the source script used 10.0, but with the
-                # default sparsity scale that saturates softmax enough to kill gradients.
                 self.c_sparse[torch.arange(self.n_blocks).unsqueeze(1),
                               idx, torch.arange(self.outputs_per_block).unsqueeze(0)] = 1.0
         else:
@@ -435,33 +346,30 @@ def make_gpt(model_cfg, data_cfg, device='cuda'):
     )
     return GPT(cfg).to(device), cfg
 
-# ---------------------------------------------------------------------------
-# Logic gate matrix  (16 gates expressed over [1, A, B, A*B])
-# ---------------------------------------------------------------------------
 
 LOGIC_GATE_MATRIX = torch.tensor([
-    [0,  0,  0,  0],  # False
-    [0,  0,  0,  1],  # AND
-    [0,  1,  0, -1],  # A AND NOT B
-    [0,  1,  0,  0],  # A
-    [0,  0,  1, -1],  # NOT A AND B
-    [0,  0,  1,  0],  # B
-    [0,  1,  1, -2],  # XOR
-    [0,  1,  1, -1],  # OR
-    [1, -1, -1,  1],  # NOR
-    [1, -1, -1,  2],  # XNOR
-    [1,  0, -1,  0],  # NOT B
-    [1,  0, -1,  1],  # A OR NOT B
-    [1, -1,  0,  0],  # NOT A
-    [1, -1,  0,  1],  # NOT A OR B
-    [1,  0,  0, -1],  # NAND
-    [1,  0,  0,  0],  # True
+    [0,  0,  0,  0],
+    [0,  0,  0,  1],
+    [0,  1,  0, -1],
+    [0,  1,  0,  0],
+    [0,  0,  1, -1],
+    [0,  0,  1,  0],
+    [0,  1,  1, -2],
+    [0,  1,  1, -1],
+    [1, -1, -1,  1],
+    [1, -1, -1,  2],
+    [1,  0, -1,  0],
+    [1,  0, -1,  1],
+    [1, -1,  0,  0],
+    [1, -1,  0,  1],
+    [1,  0,  0, -1],
+    [1,  0,  0,  0],
 ], dtype=torch.float32)
 
 
 def diff_logic_gates(a, b):
     basis = torch.stack([torch.ones_like(a), a, b, a * b], dim=-1)
-    return basis @ LOGIC_GATE_MATRIX.to(device=a.device, dtype=a.dtype).T  # (..., 16)
+    return basis @ LOGIC_GATE_MATRIX.to(device=a.device, dtype=a.dtype).T
 
 
 def annealed_temperature(step, total, start=2.0, end=0.1):
@@ -474,7 +382,7 @@ def _apply_activation(h, name):
     if name == 'tanh':        return torch.tanh(h)
     if name == 'relu':        return F.relu(h)
     if name == 'hardsigmoid': return F.hardsigmoid(h)
-    return h  # 'none'
+    return h
 
 
 def _binarize_ste(h, threshold=0.5):
@@ -498,8 +406,6 @@ def _thermometer_ste(h, n_bits, training):
     expanded = h.unsqueeze(-1).expand(*prefix, D, n_bits)
     hard = (expanded > levels).to(dtype=h.dtype)
     if training:
-        # Identity STE: backward grad = d(out_total)/dh = 1. Each of n_bits outputs
-        # contributes h/n_bits in the soft path, so summed gradient w.r.t. h = 1.
         soft = expanded / n_bits
         out = soft + (hard - soft).detach()
     else:
@@ -581,13 +487,13 @@ def _count_curve(layer, grp):
     learned curve (linear interp between integer-count knots). Honest (per-channel, no
     cross-channel mixing); strictly generalizes learn_pool's affine count->value. Init linear
     so it starts == fixed sum_pool. Hard counts are integer -> exact knot (soft==hard)."""
-    count = grp.sum(dim=-1)                                  # (N, C) in [0, g]
+    count = grp.sum(dim=-1)
     g = layer.group_size
     lo = count.detach().floor().clamp(0, g - 1)
     frac = (count - lo).clamp(0, 1)
     lo_i = lo.long()
     N, C = count.shape
-    curve = layer.pool_curve.unsqueeze(0).expand(N, C, g + 1)   # (N, C, g+1)
+    curve = layer.pool_curve.unsqueeze(0).expand(N, C, g + 1)
     v0 = torch.gather(curve, 2, lo_i.unsqueeze(-1)).squeeze(-1)
     v1 = torch.gather(curve, 2, (lo_i + 1).unsqueeze(-1)).squeeze(-1)
     return v0 * (1 - frac) + v1 * frac
@@ -645,16 +551,15 @@ def _signed_thermometer_ste(h, n_bits, training):
     *prefix, D = h.shape
     levels = torch.linspace(1.0 / (n_bits + 1), n_bits / (n_bits + 1), n_bits,
                             device=h.device, dtype=h.dtype)
-    # magnitudes squashed into [0,1): 2*sigmoid(relu(.)) - 1 maps [0,inf) -> [0,1)
-    pos_p = (2.0 * torch.sigmoid(torch.relu(h)) - 1.0).unsqueeze(-1)   # (..., D, 1)
+    pos_p = (2.0 * torch.sigmoid(torch.relu(h)) - 1.0).unsqueeze(-1)
     neg_p = (2.0 * torch.sigmoid(torch.relu(-h)) - 1.0).unsqueeze(-1)
-    sign = (h > 0).to(dtype=h.dtype).unsqueeze(-1)                     # (..., D, 1)
-    pos_hard = (pos_p > levels).to(dtype=h.dtype)                      # (..., D, n_bits)
+    sign = (h > 0).to(dtype=h.dtype).unsqueeze(-1)
+    pos_hard = (pos_p > levels).to(dtype=h.dtype)
     neg_hard = (neg_p > levels).to(dtype=h.dtype)
-    hard = torch.cat([sign, pos_hard, neg_hard], dim=-1)              # (..., D, 2n+1)
+    hard = torch.cat([sign, pos_hard, neg_hard], dim=-1)
     if training:
-        sign_soft = torch.sigmoid(h).unsqueeze(-1)                    # smooth sign surrogate
-        pos_soft = (pos_p / n_bits).expand(*prefix, D, n_bits)        # identity-STE magnitude
+        sign_soft = torch.sigmoid(h).unsqueeze(-1)
+        pos_soft = (pos_p / n_bits).expand(*prefix, D, n_bits)
         neg_soft = (neg_p / n_bits).expand(*prefix, D, n_bits)
         soft = torch.cat([sign_soft, pos_soft, neg_soft], dim=-1)
         out = soft + (hard - soft).detach()
@@ -686,9 +591,6 @@ def _lloydmax_thermometer_ste(layer, h, training):
         out = hard
     return out.reshape(h.shape[0], h.shape[1] * layer.n_bits)
 
-# ---------------------------------------------------------------------------
-# Soft learnable logic layer
-# ---------------------------------------------------------------------------
 
 def _sample_cand(in_dim, shape, generator, cand_dist=None):
     """Sample candidate input indices. Uniform random by default; if cand_dist (an importance
@@ -698,8 +600,6 @@ def _sample_cand(in_dim, shape, generator, cand_dist=None):
     for s in shape:
         n *= s
     if cand_dist is not None:
-        # CPU generator -> sample on CPU regardless of the model's device (the buffer moves
-        # with the module later). Fixes cuda-tensor + cpu-generator multinomial mismatch.
         d = cand_dist.detach().cpu().to(torch.float).clamp_min(0) + 1e-6
         idx = torch.multinomial(d, n, replacement=True, generator=generator)
         return idx.reshape(*shape)
@@ -716,9 +616,6 @@ class LearnedLogicLayer(nn.Module):
         self.k = k
         self.interconnect = interconnect
         self.temperature = float(temperature)
-        # CAGE (Align Forward Adapt Backward, 2026): independent backward-pass temperature.
-        # None = use self.temperature for backward (vanilla STE). When set, softmax(logits/τ_b)
-        # is used in the STE backward path while forward stays hard argmax.
         self.backward_temp = None
         self.identity = identity
         g = torch.Generator()
@@ -794,7 +691,6 @@ class LearnedLogicLayer(nn.Module):
     def _select(self, x, cand, logits, hard, ste=False):
         gathered = x[:, cand]
         if ste:
-            # STE (vanilla or CAGE if backward_temp set): forward=hard, backward=soft.
             soft = self._sm_back(logits)
             hard_w = F.one_hot(logits.argmax(dim=-1), self.k).to(dtype=x.dtype)
             w = soft + (hard_w - soft).detach()
@@ -806,7 +702,7 @@ class LearnedLogicLayer(nn.Module):
 
     def forward(self, x, hard=False, ste=False):
         if self.identity:
-            return x  # ablation: bypass all logic computation
+            return x
         if self.interconnect == 'topk_block_sparse':
             a = self.topk_a(x, hard=hard, ste=ste)
             b = self.topk_b(x, hard=hard, ste=ste)
@@ -824,9 +720,6 @@ class LearnedLogicLayer(nn.Module):
             gp = self._sm(self.gate_logits)
         return (gates * gp).sum(dim=-1)
 
-# ---------------------------------------------------------------------------
-# GPT block wrapper: norm -> sigmoid(proj) -> logic stack -> proj + residual
-# ---------------------------------------------------------------------------
 
 class LogicGateGPTLayer(nn.Module):
     def __init__(self, gpt_cfg, layer_idx, logic_width=None, depth=1, k=4, seed=1000,
@@ -857,9 +750,7 @@ class LogicGateGPTLayer(nn.Module):
         self.learn_pool = learn_pool
         self.token_shift = token_shift
         self.signed_encoding = signed_encoding
-        # bits emitted per input scalar (signed encoding triples-ish the budget)
         self._bps = signed_bits_per_scalar(self.n_bits) if signed_encoding else self.n_bits
-        # Causal token shift: each position sees [x[t-K]..x[t]]. eff_C = (K+1)*C.
         self._taps = list(range(1, token_shift + 1)) if token_shift > 0 else []
         eff_C = C * (len(self._taps) + 1)
         self.eff_C = eff_C
@@ -885,9 +776,6 @@ class LogicGateGPTLayer(nn.Module):
             bit_width = logic_in_C * self._bps
         else:
             bit_width = self.logic_width * self._bps
-        # Output-side resolution: widen the FINAL logic layer by out_gate_mult so each output
-        # channel sums more gates -> a finer readout (group_size*mult levels). Decouples output
-        # resolution from input n_bits (which in aggressive mode also sets group_size).
         if identity_logic and out_gate_mult != 1:
             raise ValueError("identity_logic is incompatible with out_gate_mult>1 (non-square logic).")
         self.out_gate_mult = out_gate_mult
@@ -899,11 +787,9 @@ class LogicGateGPTLayer(nn.Module):
             self.group_size = out_width // C
             self.weighted_pool = weighted_pool
             if weighted_pool:
-                # per-channel, per-bit weight; init uniform (2/g) + (-1) bias == learn_pool/fixed.
                 self.pool_w = nn.Parameter(torch.full((C, self.group_size), 2.0 / self.group_size))
                 self.pool_b = nn.Parameter(torch.full((C,), -1.0))
             elif learn_pool:
-                # Init to match fixed centering: (pooled - g/2)/(g/2) = pooled*(2/g) - 1
                 self.pool_scale = nn.Parameter(torch.full((C,), 2.0 / self.group_size))
                 self.pool_shift = nn.Parameter(torch.full((C,), -1.0))
         else:
@@ -911,9 +797,6 @@ class LogicGateGPTLayer(nn.Module):
         self.norm = nn.LayerNorm(C)
         if not no_in_proj:
             self.in_proj = nn.Linear(logic_in_C, self.logic_width)
-        # depth-1 intermediate layers stay square (bit_width); the last widens to out_width.
-        # lut_k>=2 swaps the 2-input gate for a more expressive K-input LUT gate.
-        # A1: residual wiring -> deeper layers read [input_bits, prev_out] (2x in_dim).
         self.lut_k = lut_k
         def _in(i):
             return bit_width if i == 0 else (2 * bit_width if self.logic_residual else bit_width)
@@ -941,7 +824,6 @@ class LogicGateGPTLayer(nn.Module):
         _init_readout_extras(self, residual_scale, pool_curve)
         if not sum_pool:
             self.out_proj = nn.Linear(out_width, C)
-        # Per-channel binary calibration on the pre-thermometer features (width = bit_width//n_bits).
         self.learn_binary_calibration = learn_binary_calibration
         if learn_binary_calibration:
             feat_w = logic_in_C if no_in_proj else self.logic_width
@@ -965,7 +847,7 @@ class LogicGateGPTLayer(nn.Module):
         elif binary_encoder != 'activation':
             raise ValueError(f"unknown binary_encoder '{binary_encoder}'")
         self.dropout = nn.Dropout(gpt_cfg.dropout)
-        self.use_ste = False  # STE toggle (set during fine-tune / CAGE)
+        self.use_ste = False
 
     def _squash(self, h):
         """Map features into [0,1] before binarization. Calibration mode replaces the
@@ -1026,9 +908,6 @@ class LogicGateGPTLayer(nn.Module):
         h = _run_logic_stack(self, h, hard, ste)
         return x + self.dropout(self._apply_post_conv(self._aggregate(h, B, T)))
 
-# ---------------------------------------------------------------------------
-# Hard (fully discrete) versions
-# ---------------------------------------------------------------------------
 
 class HardLogicLayer(nn.Module):
     def __init__(self, soft: LearnedLogicLayer):
@@ -1059,14 +938,6 @@ class HardLogicLayer(nn.Module):
         return c[:, 0] + c[:, 1]*a + c[:, 2]*b + c[:, 3]*a*b
 
 
-# ---------------------------------------------------------------------------
-# K-input LUT gate (LUT-K): a more expressive primitive than the 2-input gate.
-# Each output selects K inputs and applies a learned 2^K-entry truth table via the
-# multilinear extension (out = sum_corners T[c] * prod_i [a_i if c_i else 1-a_i]),
-# the K-input generalization of the 2-input [1,A,B,AB] polynomial. Hard-snaps to a
-# discrete LUT-K = exactly one FPGA LUT. lut_k=2 reproduces the 2-input gate's expressivity.
-# ---------------------------------------------------------------------------
-
 def _corner_table(lut_k, device=None, dtype=torch.float32):
     return torch.tensor([[(i >> b) & 1 for b in range(lut_k)] for i in range(2 ** lut_k)],
                         dtype=dtype, device=device)
@@ -1076,13 +947,13 @@ def _multilinear(a, corners, T):
     """Multilinear extension of a truth table. a: (N, M, K) inputs in [0,1]; corners: (2^K, K);
     T: (..., M, 2^K) -> (N, M). Builds the per-corner product incrementally (peak (N,M,2^K),
     not (N,M,2^K,K)) so the 12-layer model fits in memory."""
-    weights = None                                       # (N, M, 2^K)
-    for s in range(corners.shape[1]):                    # over the K input slots
-        cs = corners[:, s]                               # (2^K,)
-        a_s = a[..., s:s + 1]                            # (N, M, 1)
-        factor = cs * a_s + (1 - cs) * (1 - a_s)         # (N, M, 2^K)
+    weights = None
+    for s in range(corners.shape[1]):
+        cs = corners[:, s]
+        a_s = a[..., s:s + 1]
+        factor = cs * a_s + (1 - cs) * (1 - a_s)
         weights = factor if weights is None else weights * factor
-    return (weights * T).sum(dim=-1)                     # (N, M)
+    return (weights * T).sum(dim=-1)
 
 
 class LearnedLUTLayer(nn.Module):
@@ -1101,12 +972,9 @@ class LearnedLUTLayer(nn.Module):
         g = torch.Generator()
         if seed is not None:
             g.manual_seed(seed)
-        # Gated pairs (A2): internally double the LUT bank; output = lut_a * lut_b (hard: AND).
-        # A 2K-input function class at an honest 2x LUT cost.
         self.gated = gated
         M = out_dim * (2 if gated else 1)
         self.M = M
-        # K input slots, each selected via softmax over k candidate connections (random or MLP-guided)
         if interconnect == 'topk_block_sparse':
             self.topk = TopKBlockSparseInterconnect(
                 in_dim, M * lut_k, topk_sparse_k, name='lut_topk',
@@ -1116,7 +984,6 @@ class LearnedLUTLayer(nn.Module):
             self.conn_logits = nn.Parameter(torch.randn(M, lut_k, k) * conn_init_scale)
         else:
             raise ValueError(f"unknown interconnect '{interconnect}'")
-        # 2^K learnable truth-table logits per output (sigmoid -> [0,1], snap -> {0,1})
         self.lut_logits = nn.Parameter(torch.randn(M, 2 ** lut_k) * gate_init_scale)
         self.register_buffer('corners', _corner_table(lut_k))
 
@@ -1158,7 +1025,7 @@ class LearnedLUTLayer(nn.Module):
 
     def _select(self, x, slot, hard, ste):
         cand, logits = self.cand[:, slot], self.conn_logits[:, slot]
-        gathered = x[:, cand]                              # (N, out_dim, k)
+        gathered = x[:, cand]
         if ste:
             soft = self._sm_back(logits)
             hard_w = F.one_hot(logits.argmax(dim=-1), self.k).to(dtype=x.dtype)
@@ -1167,7 +1034,7 @@ class LearnedLUTLayer(nn.Module):
             w = F.one_hot(logits.argmax(dim=-1), self.k).to(dtype=x.dtype)
         else:
             w = self._sm(logits)
-        return (gathered * w).sum(dim=-1)                  # (N, out_dim)
+        return (gathered * w).sum(dim=-1)
 
     def forward(self, x, hard=False, ste=False):
         if self.identity:
@@ -1175,7 +1042,7 @@ class LearnedLUTLayer(nn.Module):
         if self.interconnect == 'topk_block_sparse':
             a = self.topk(x, hard=hard, ste=ste).view(x.shape[0], self.M, self.lut_k)
         else:
-            a = torch.stack([self._select(x, s, hard, ste) for s in range(self.lut_k)], dim=-1)  # (N,M,K)
+            a = torch.stack([self._select(x, s, hard, ste) for s in range(self.lut_k)], dim=-1)
         if ste:
             t = self.backward_temp if self.backward_temp is not None else self.temperature
             soft = torch.sigmoid(self.lut_logits / t)
@@ -1186,7 +1053,7 @@ class LearnedLUTLayer(nn.Module):
         else:
             T = torch.sigmoid(self.lut_logits / self.temperature)
         y = _multilinear(a, self.corners, T.unsqueeze(0))
-        if self.gated:                                     # (N, 2*out) -> AND/product of halves
+        if self.gated:
             half = y.shape[-1] // 2
             y = y[:, :half] * y[:, half:]
         return y
@@ -1204,7 +1071,7 @@ class HardLUTLayer(nn.Module):
             if self.interconnect == 'topk_block_sparse':
                 self.topk = HardTopKBlockSparseInterconnect(soft.topk)
             else:
-                choice = soft.conn_logits.argmax(dim=-1)               # (out_dim, lut_k)
+                choice = soft.conn_logits.argmax(dim=-1)
                 idx = soft.cand.gather(2, choice.unsqueeze(-1)).squeeze(-1)
                 self.register_buffer('idx', idx.clone())
             self.register_buffer('lut', (soft.lut_logits > 0).to(torch.float32))
@@ -1216,10 +1083,10 @@ class HardLUTLayer(nn.Module):
         if self.interconnect == 'topk_block_sparse':
             a = self.topk(x).view(x.shape[0], self.M, self.lut_k)
         else:
-            a = x[:, self.idx]                                      # (N, M, lut_k)
+            a = x[:, self.idx]
         T = self.lut.to(device=x.device, dtype=x.dtype).unsqueeze(0)
         y = _multilinear(a, self.corners.to(dtype=x.dtype), T)
-        if self.gated:                                              # AND of the two LUT banks
+        if self.gated:
             half = y.shape[-1] // 2
             y = y[:, :half] * y[:, half:]
         return y
@@ -1329,10 +1196,6 @@ class HardLogicGateGPTLayer(nn.Module):
         return x + self.dropout(self._apply_post_conv(self._aggregate(h, B, T)))
 
 
-# ---------------------------------------------------------------------------
-# Recurrent / stateful LGN layer (RDDLGN-inspired, NOT full encoder-decoder RDDLGN)
-# ---------------------------------------------------------------------------
-
 class RecurrentLogicGateGPTLayer(nn.Module):
     """Stateful logic block. Per token, a logic stack updates a hidden state from the
     current token's bits and the previous state:
@@ -1355,7 +1218,6 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         self.layer_idx = layer_idx
         self.logic_width = logic_width or C * 4
         self.activation = activation
-        # Guardrails: fail early & clearly on configs the recurrent layer cannot honour.
         if not binary_io:
             raise ValueError("recurrent LGN requires binary_io=True (logic operates on bits).")
         if not sum_pool:
@@ -1370,10 +1232,8 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         self.no_in_proj = no_in_proj
         self.learn_pool = learn_pool
         self.state_init = state_init
-        # token feature width fed into the logic stack (before binarization)
         token_feat = C if no_in_proj else self.logic_width
         self.token_bw = token_feat * n_bits
-        # hidden state width (default = token bit width); must divide C for group-sum
         self.state_width = state_width if state_width is not None else self.token_bw
         if self.state_width % C != 0:
             raise ValueError(
@@ -1383,7 +1243,6 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         self.norm = nn.LayerNorm(C)
         if not no_in_proj:
             self.in_proj = nn.Linear(C, self.logic_width)
-        # logic stack: first layer reads [token_bits, state], the rest read state only
         layers = []
         for i in range(recurrent_depth):
             in_dim = (self.token_bw + self.state_width) if i == 0 else self.state_width
@@ -1400,7 +1259,6 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         self.dropout = nn.Dropout(gpt_cfg.dropout)
         self.use_ste = False
 
-    # --- API shared with LogicGateGPTLayer ---
     def set_temperature(self, t):
         for l in self.logic: l.set_temperature(t)
 
@@ -1421,7 +1279,6 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         stats = [l.sharpness() for l in self.logic]
         return {k: sum(s[k] for s in stats) / len(stats) for k in ['conn_a', 'conn_b', 'gate']}
 
-    # --- forward machinery ---
     def _token_bits(self, x, training):
         h = self.norm(x)
         if not self.no_in_proj:
@@ -1437,7 +1294,7 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         if self.state_init == 'learned':
             return self.initial_state.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1)
         if self.state_init == 'residual':
-            first = token_bits[:, 0]                                  # (B, token_bw)
+            first = token_bits[:, 0]
             if self.token_bw >= self.state_width:
                 return first[:, :self.state_width]
             pad = torch.zeros(B, self.state_width - self.token_bw, device=device, dtype=dtype)
@@ -1448,21 +1305,21 @@ class RecurrentLogicGateGPTLayer(nn.Module):
         grp = state.view(B, self.C, self.group_size)
         if self.learn_pool:
             return grp.sum(dim=-1) * self.pool_scale + self.pool_shift
-        return (grp.sum(dim=-1) - self.group_size / 2) / (self.group_size / 2)   # (B, C)
+        return (grp.sum(dim=-1) - self.group_size / 2) / (self.group_size / 2)
 
     def _run(self, x, hard, ste, training):
         B, T, C = x.shape
-        token_bits = self._token_bits(x, training)                   # (B, T, token_bw)
+        token_bits = self._token_bits(x, training)
         state = self._init_state(B, token_bits, x.device, x.dtype)
         outs = []
-        for t in range(T):                                           # causal: only past/current
+        for t in range(T):
             z = torch.cat([token_bits[:, t], state], dim=-1)
             s = self.logic[0](z, hard=hard, ste=ste)
             for l in self.logic[1:]:
                 s = l(s, hard=hard, ste=ste)
             state = s
             outs.append(self._aggregate_state(state, B))
-        return torch.stack(outs, dim=1)                              # (B, T, C)
+        return torch.stack(outs, dim=1)
 
     def forward(self, x, hard=False):
         ste = self.use_ste and not hard
@@ -1539,23 +1396,11 @@ class HardRecurrentLogicGateGPTLayer(nn.Module):
         return x + self.dropout(torch.stack(outs, dim=1))
 
 
-# ---------------------------------------------------------------------------
-# Gated recurrent LGN: flip-flop / latch-style state retention (opt-in).
-#   candidate_t = LogicCandidate([token_bits_t, state_{t-1}])
-#   keep_t      = LogicKeep([token_bits_t, state_{t-1}])
-#   state_t     = keep_t * state_{t-1} + (1 - keep_t) * candidate_t   (soft)
-#   state_t     = where(keep_t, state_{t-1}, candidate_t)             (hard)
-# The keep gate is itself a learned LOGIC stack (not a sigmoid/dense gate). This is an
-# extension inspired by flip-flop/latch state retention; the original RDDLGN paper does
-# NOT claim a GRU-style keep gate.
-# ---------------------------------------------------------------------------
-
 class GatedRecurrentLogicGateGPTLayer(RecurrentLogicGateGPTLayer):
     """Recurrent LGN with a logic-based keep/overwrite gate (opt-in extension)."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gated = True
-        # `self.logic` (from the parent) is the CANDIDATE stack. Build a same-shape KEEP stack.
         keep = []
         for i, cand_layer in enumerate(self.logic):
             keep.append(LearnedLogicLayer(
@@ -1563,7 +1408,6 @@ class GatedRecurrentLogicGateGPTLayer(RecurrentLogicGateGPTLayer):
                 seed=1234 + self.layer_idx * 100 + 70 + i))
         self.keep_logic = nn.ModuleList(keep)
 
-    # --- API: iterate BOTH candidate (self.logic) and keep stacks ---
     def _all(self):
         return list(self.logic) + list(self.keep_logic)
 
@@ -1602,7 +1446,7 @@ class GatedRecurrentLogicGateGPTLayer(RecurrentLogicGateGPTLayer):
             if hard:
                 state = torch.where(keep > 0.5, state, cand)
             else:
-                state = keep * state + (1.0 - keep) * cand   # keep in {0,1} under STE
+                state = keep * state + (1.0 - keep) * cand
             outs.append(self._aggregate_state(state, B))
         return torch.stack(outs, dim=1)
 
@@ -1610,7 +1454,7 @@ class GatedRecurrentLogicGateGPTLayer(RecurrentLogicGateGPTLayer):
 class HardGatedRecurrentLogicGateGPTLayer(HardRecurrentLogicGateGPTLayer):
     """Hard-snapped mirror of GatedRecurrentLogicGateGPTLayer."""
     def __init__(self, soft: GatedRecurrentLogicGateGPTLayer):
-        super().__init__(soft)                                   # sets up norm/in_proj/pool/init + candidate self.logic
+        super().__init__(soft)
         self.keep_logic = nn.ModuleList([HardLogicLayer(l) for l in soft.keep_logic])
         for p in self.parameters():
             p.requires_grad = False
@@ -1632,10 +1476,6 @@ class HardGatedRecurrentLogicGateGPTLayer(HardRecurrentLogicGateGPTLayer):
             outs.append(self._aggregate_state(state, B))
         return x + self.dropout(torch.stack(outs, dim=1))
 
-
-# ---------------------------------------------------------------------------
-# Hybrid layer: keep original (trained) attention sublayer, replace MLP only
-# ---------------------------------------------------------------------------
 
 class HybridLogicGateGPTLayer(nn.Module):
     """Drop-in replacement for a nanoGPT Block where the attention sublayer is
@@ -1717,17 +1557,12 @@ class HybridLogicGateGPTLayer(nn.Module):
         else:
             self.weighted_pool = weighted_pool
 
-        # FROZEN: attention sublayer copied verbatim from the trained baseline.
         self.ln_1 = copy.deepcopy(original_block.ln_1)
         self.attn = copy.deepcopy(original_block.attn)
         for p in self.ln_1.parameters(): p.requires_grad = False
         for p in self.attn.parameters(): p.requires_grad = False
         self.ln_1.eval(); self.attn.eval()
 
-        # Pre-MLP norm (ln_2): how faithfully we keep the trained pre-FFN signal.
-        #   fresh          -> new LayerNorm (legacy default)
-        #   copy_trainable -> copy trained ln_2, fine-tune it (faithful + recalibration)
-        #   copy_frozen    -> copy trained ln_2, freeze (only the MLP FUNCTION changes)
         if ln2_mode not in ('fresh', 'copy_trainable', 'copy_frozen'):
             raise ValueError(f"unknown hybrid_ln2 mode '{ln2_mode}' "
                              "(expected 'fresh' | 'copy_trainable' | 'copy_frozen').")
@@ -1739,20 +1574,15 @@ class HybridLogicGateGPTLayer(nn.Module):
             if ln2_mode == 'copy_frozen':
                 for p in self.ln_2.parameters(): p.requires_grad = False
 
-        # TRAINABLE: LGN MLP replacement (same shape as LogicGateGPTLayer)
         if not no_in_proj:
             self.in_proj = nn.Linear(logic_in_C, self.logic_width)
         self.lut_k = lut_k
-        # Functional init: bias the (otherwise random) candidate connections of the FIRST logic
-        # layer toward the input channels the trained MLP weights most heavily (||W1[:,c]||),
-        # attacking the dead-candidate lottery. Only layer 0 reads the input bits.
         cand_dist = None
         if mlp_guided_init and hasattr(original_block, 'mlp') and hasattr(original_block.mlp, 'c_fc'):
-            imp = original_block.mlp.c_fc.weight.detach().norm(dim=0)        # [C] per-channel
+            imp = original_block.mlp.c_fc.weight.detach().norm(dim=0)
             reps = (logic_in_C + C - 1) // C
             imp = imp.repeat(reps)[:logic_in_C].repeat_interleave(self._bps)
             cand_dist = imp
-        # A1: with residual wiring, deeper layers read [input_bits, prev_out] -> 2x in_dim.
         def _in(i):
             return bit_width if i == 0 else (2 * bit_width if self.logic_residual else bit_width)
         self.logic = nn.ModuleList([
@@ -1857,7 +1687,7 @@ class HybridLogicGateGPTLayer(nn.Module):
         return y
 
     def forward(self, x, hard=False):
-        x = x + self.attn(self.ln_1(x))          # FROZEN attention
+        x = x + self.attn(self.ln_1(x))
         B, T, C = x.shape
         normed = self._apply_pre_conv(apply_token_shift(self.ln_2(x), self._taps))
         h = self._apply_in_proj(normed, B, T)
