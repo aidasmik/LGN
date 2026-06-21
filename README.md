@@ -23,29 +23,29 @@ Trumpai, kaip LGN keičia FFN: gaunama kanalo aktyvacija, ji binarizuojama (kiek
 
 Pirma atmesta **precision**. Prielaida buvo, kad riboja binarizacijos tikslumas, bet ne: 8-bit įvestis duoda tą patį kaip 16-bit (perpus mažiau bitų, tas pats acc), o weighted_pool (mokami per-bitiniai readout svoriai) nepridėjo nieko. Riba - gryna **capacity** (kiek gates ir kokie galingi), ne kodavimas.
 
-![svertai](results/figs/report/fig2_levers.png)
+![kas labiausiai padeda](results/figs/report/fig2_levers.png)
 
-Stipriausias svertas - **gate count output'e**. sum_pool nuskaito grupę gates į vieną skaičių, tad daugiau gates grupėje reiškia daugiau galimų lygių kanalui (didesnė readout rezoliucija). Vien tai duoda 35.4 -> 38.3 -> 41.8% (1x -> 2x -> 4x). Capacity dedama netolygiai: globaliai 4x, o sunkiausiems sluoksniams (L0, L9, L10, L11) 8x.
+Daugiausiai padeda **gate count output'e**. sum_pool nuskaito grupę gates į vieną skaičių, tad daugiau gates grupėje reiškia daugiau galimų lygių kanalui (didesnė readout rezoliucija). Vien tai duoda 35.4 -> 38.3 -> 41.8% (1x -> 2x -> 4x). Capacity dedama netolygiai: globaliai 4x, o sunkiausiems sluoksniams (L0, L9, L10, L11) 8x.
 
-Antras svertas - **gate arity (LUT-K)**. 2-input gate yra silpniausias primityvas (16 funkcijų iš dviejų bitų). Vietoj jo naudojamas k-input LUT gate: mokoma 2^K-įrašų truth table, soft treniruojant įvertinama per multilinear extension, hard'e snap'inasi į vieną FPGA LUT-K. Ant L0 LUT4 prilygsta maždaug 2x daugiau 2-input gates, LUT6 maždaug 2.7x; visame modelyje efektas kuklesnis (apie +0.9 pp), nes nauda susikoncentruoja sunkiuose sluoksniuose.
+Kitas dalykas - **gate arity (LUT-K)**. 2-input gate yra silpniausias įmanomas vartas (16 funkcijų iš dviejų bitų). Vietoj jo naudojamas k-input LUT gate: mokoma 2^K-įrašų truth table, soft treniruojant įvertinama per multilinear extension, hard'e snap'inasi į vieną FPGA LUT-K. Ant L0 LUT4 prilygsta maždaug 2x daugiau 2-input gates, LUT6 maždaug 2.7x; visame modelyje efektas kuklesnis (apie +0.9 pp), nes nauda susikoncentruoja sunkiuose sluoksniuose.
 
-Kodėl būtent L0 ir paskutiniai: pakeitus po vieną FFN matosi aiški hierarchija - L0 sunkiausias (apie 6x už bet kurį kitą), vidurio FFN (L1-L6) beveik nemokami (juos pakeitus val loss net pagerėja), o pabaiga (ypač L11) vėl sunkesnė.
+Kodėl būtent L0 ir paskutiniai: pakeitus po vieną FFN aiškiai matosi, kurie sluoksniai sunkesni - L0 sunkiausias (apie 6x už bet kurį kitą), vidurio FFN (L1-L6) beveik nemokami (juos pakeitus val loss net pagerėja), o pabaiga (ypač L11) vėl sunkesnė.
 
 ![sluoksnių sunkumas](results/figs/report/fig6_per_layer.png)
 
-Likę svertai - **training**, nedidinantys gate count. Diskretizacija sukuria soft-hard gap'ą (treniruojama soft, inference hard). Jį tvarko STE (forward diskretus, backward gradientas pro jį tarsi tolydus) ir CAGE (forward kietas, argmax kaip inference; backward minkštas su adaptyvia temperatūra, gap'as sumažėja maždaug perpus). Dar pasirenkamas geriausias checkpoint pagal hard rezultatą, ne soft (apie +0.8 pp), ir LGN mokomas atkartoti visą transformerio output distribution, ne tik teisingą byte'ą (KL distillation, apie +0.5 pp). Connections irgi svarbu - kiekvienas gate renkasi iš k kandidatinių input laidų (k=16).
+Likę pagerinimai - **training** pusėje, nedidinantys gate count. Diskretizacija sukuria soft-hard gap'ą (treniruojama soft, inference hard). Jį tvarko STE (forward diskretus, backward gradientas pro jį tarsi tolydus) ir CAGE (forward kietas, argmax kaip inference; backward minkštas su adaptyvia temperatūra, gap'as sumažėja maždaug perpus). Dar pasirenkamas geriausias checkpoint pagal hard rezultatą, ne soft (apie +0.8 pp), ir LGN mokomas atkartoti visą transformerio output distribution, ne tik teisingą byte'ą (KL distillation, apie +0.5 pp). Connections irgi svarbu - kiekvienas gate renkasi iš k kandidatinių input laidų (k=16).
 
-Viskas suvedama nuosekliai: pirma kiekvienas LGN sluoksnis warm-startinamas imituojant originalų FFN (MSE), tada visas fine-tune'inamas kartu, o sluoksniai keičiami po vieną - lengviausias pirma, kad likęs tinklas spėtų prisitaikyti. Sudėjus visus svertus (out_gate_mult 8 + k16 + LUT4 + CAGE + best-hard + KL), 35.4% pakilo iki 48.2%.
+Viskas suvedama nuosekliai: pirma kiekvienas LGN sluoksnis warm-startinamas imituojant originalų FFN (MSE), tada visas fine-tune'inamas kartu, o sluoksniai keičiami po vieną - lengviausias pirma, kad likęs tinklas spėtų prisitaikyti. Sudėjus visus šiuos pagerinimus (out_gate_mult 8 + k16 + LUT4 + CAGE + best-hard + KL), 35.4% pakilo iki 48.2%.
 
 ## Ablation testas
 
-Su tiek aplinkinių komponentų (ln, pooling, residual, užšaldytas attention) lengva apsigauti, kad pagerinimą duoda jie, o ne pati logika. Todėl visa instaliacija paliekama, bet gates išjungiami (identity) - toks variantas pasiekia tik 26.5%, vadinasi LGN realiai prideda **+21.7 pp**. Darbą atlieka gates, ne pooling ar residual.
+Su tiek aplinkinių komponentų (ln, pooling, residual, užšaldytas attention) lengva apsigauti, kad pagerinimą duoda jie, o ne pati logika. Todėl visa aplinka paliekama, bet gates išjungiami (identity) - toks variantas pasiekia tik 26.5%, vadinasi LGN realiai prideda **+21.7 pp**. Darbą atlieka gates, ne pooling ar residual.
 
 ![ablation](results/figs/report/fig3_honesty.png)
 
 ## Pure LGN su token shift
 
-Svarbu patikrinti, ar svertai veikia tik su attention, ar ir be jo. Be attention cross-token sprendžiamas pigiai - token-shift'u (prie kiekvienos pozicijos pridedamos kelios praėjusios, jokių mokomų parametrų). Su token-shift vietoj attention tas pats optimizuotas LGN pasiekia 43.54%, arba 80% transformerio. Tai rodo, kad pagerintas pats FFN-pakaitalas, o ne pasinaudota attention'u.
+Svarbu patikrinti, ar šie pagerinimai veikia tik su attention, ar ir be jo. Be attention cross-token sprendžiamas pigiai - token-shift'u (prie kiekvienos pozicijos pridedamos kelios praėjusios, jokių mokomų parametrų). Su token-shift vietoj attention tas pats optimizuotas LGN pasiekia 43.54%, arba 80% transformerio. Tai rodo, kad pagerintas pats FFN-pakaitalas, o ne pasinaudota attention'u.
 
 ## Palyginimas su ankstesniais aproachais
 
