@@ -62,11 +62,6 @@ def fig_headline():
     for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v + 0.6, f'{v:.1f}%',
                 ha='center', va='bottom', fontweight='bold', fontsize=11)
-    # % of transformer annotations on the two LGN bars
-    ax.text(1, att / 2, f'{att/tf*100:.0f}% of\ntransformer', ha='center', va='center',
-            color='white', fontweight='bold', fontsize=10)
-    ax.text(2, pure / 2, f'{pure/pure_tf*100:.0f}% of\ntransformer', ha='center', va='center',
-            color='white', fontweight='bold', fontsize=10)
     ax.set_ylabel('Next-byte top-1 accuracy (%)')
     ax.set_title('LGN as an FFN replacement', fontsize=13)
     ax.set_ylim(0, 60)
@@ -133,11 +128,6 @@ def fig_honesty():
     bars = ax.bar(labels, vals, color=cols, edgecolor='white', width=0.6)
     for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v + 0.6, f'{v:.1f}%', ha='center', fontweight='bold')
-    ax.annotate('', xy=(1.5, best), xytext=(1.5, ident),
-                arrowprops=dict(arrowstyle='<->', color=C_GOOD, lw=2))
-    ax.text(1.5, (best + ident) / 2, f'learned logic\ncontributes\n+{best-ident:.1f} pp',
-            color=C_GOOD, fontweight='bold', va='center', ha='center',
-            bbox=dict(boxstyle='round', fc='white', ec=C_GOOD))
     ax.axhline(tf, color=C_TF, ls='--', lw=1, alpha=0.5)
     ax.text(0, tf + 0.4, f'transformer ceiling {tf:.1f}%', color=C_TF, fontsize=9)
     ax.set_ylabel('Hard accuracy (%)')
