@@ -1,5 +1,7 @@
 # LGN-Nano: FFN keitimas į Logic Gate Network transformeryje
 
+Šis projektas tiria, kiek transformerio (nanoGPT) galima pakeisti diferencijuojamais **Logic Gate Networks (LGN)** — tinklais iš mokomų Boolean vartų (AND, XOR ir t.t.) vietoj float matricų daugybų. Motyvacija — efektyvumas: LGN natūraliai mapinasi į hardware (kiekvienas vartas ≈ 1 FPGA LUT), tad jei jie sugeba atlikti transformerio darbą, tai duotų didelę naudą inference greičio ir energijos prasme. Visur naudoju tą patį setup'ą — nanoGPT (12 sluoksnių × 128d × 4 heads), byte-level WikiText-2.
+
 Išbandžiau aproachą — optimizuoti LGN kaip FFN replacement, paliekant attention sluoksnį. Šis aproachas davė labai gerų rezultatų, kurie perėjo net ir į variantą be palikto attention, naudojant token shift.
 
 Idėja tokia: užšaldęs jau ištreniruotą attention visuose 12 sluoksnių, keičiau tik FFN į LGN. Taip izoliuoju vieną klausimą — kiek gerai pats LGN gali atlikti per-token darbą, kai cross-token (attention) jau idealus. Metrika visur — next-byte top-1 accuracy ant fiksuoto (seed-1234) byte-level WikiText-2 val batch'o, ir LGN visada matuoju kaip **hard** (diskretų) modelį, lygiai kaip realiame inference, kad skaičius nebūtų išpūstas soft relaxation'o. Baseline'as buvo tik 35.4% acc (transformerio 54.87%), bet galiausiai pavyko pasiekti 48.18%, 88% transformerio.
