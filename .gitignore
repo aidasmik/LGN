@@ -41,3 +41,7 @@ Thumbs.db
 
 # Diagnostic logs
 sg_*.log
+
+# Redundant Colab snapshot (regenerated from root code)
+lgn_colab/
+lgn_colab.zip

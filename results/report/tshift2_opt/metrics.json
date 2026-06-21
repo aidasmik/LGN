@@ -1,0 +1,13 @@
+{
+  "transformer": {
+    "loss": 1.55017,
+    "perplexity": 4.7123,
+    "accuracy": 0.54674
+  },
+  "lgn_hard": {
+    "loss": 1.95954,
+    "perplexity": 7.0961,
+    "accuracy": 0.43535
+  },
+  "n_lgn_layers": 12
+}

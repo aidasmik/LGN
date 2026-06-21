@@ -23,6 +23,60 @@ def _common_args(p):
     p.add_argument('--gate_init_scale', type=float, default=0.02)
     p.add_argument('--hybrid_layers',   type=int,   nargs='*', default=[],
                    help='layer indices that keep original attention; logic replaces MLP only')
+    p.add_argument('--hybrid_all',      action='store_true',
+                   help='shortcut: keep frozen pretrained attention in EVERY layer, replace only the '
+                        'FFN/MLP with LGN (expands to --hybrid_layers 0..n_layer-1).')
+    p.add_argument('--hybrid_ln2',      type=str, default='fresh',
+                   choices=['fresh', 'copy_trainable', 'copy_frozen'],
+                   help="hybrid pre-MLP norm: fresh (legacy) | copy_trainable (copy trained ln_2, "
+                        "tune it) | copy_frozen (copy + freeze; only the MLP function changes).")
+    p.add_argument('--learn_binary_calibration', action='store_true',
+                   help='per-channel learned sigmoid(scale*x+bias) before thermometer encoding '
+                        '(maps ~Gaussian post-norm activations into bits; init = plain sigmoid).')
+    p.add_argument('--precision_layers', type=int, nargs='*', default=[],
+                   help='layer indices that use --high_n_bits instead of --n_bits '
+                        '(spend precision only on quantization-sensitive layers, e.g. 0 9 10 11).')
+    p.add_argument('--high_n_bits', type=int, default=16,
+                   help='n_bits for layers in --precision_layers (default 16).')
+    p.add_argument('--out_gate_mult', type=int, default=1,
+                   help='widen the final logic layer by this factor -> finer sum_pool readout '
+                        '(more output levels). Decouples OUTPUT resolution from input n_bits.')
+    p.add_argument('--out_gate_mult_layers', type=str, nargs='*', default=[],
+                   help='per-layer out_gate_mult as LAYER:VALUE pairs, e.g. 0:8 11:4 10:4. '
+                        'Unlisted layers use the global --out_gate_mult.')
+    p.add_argument('--lut_k_layers', type=str, nargs='*', default=[],
+                   help='per-layer lut_k as LAYER:VALUE pairs, e.g. 0:6 11:6 8:4. '
+                        'Unlisted layers use the global --lut_k.')
+    p.add_argument('--lut_k', type=int, default=0,
+                   help='gate primitive arity: 0/2 = 2-input gate (LUT2); >=3 = K-input LUT gate '
+                        '(learned 2^K truth table, hard-snaps to one FPGA LUT-K). More expressive '
+                        'per gate; tests whether the primitive beats more 2-input gates at equal count.')
+    p.add_argument('--logic_residual', action='store_true',
+                   help='A1: DAG/residual depth -- gate layers past the first read BOTH the '
+                        'input bits and the previous layer output (needs --depth >= 2).')
+    p.add_argument('--gated_lut', action='store_true',
+                   help='A2: gated LUT pairs -- each output = LUT_a AND LUT_b (2x LUT cost, '
+                        '2K-input function class). Requires --lut_k >= 2.')
+    p.add_argument('--ft_keep_best_hard', action='store_true',
+                   help='B4: select by hard validation -- keep the best-hard checkpoint seen '
+                        'during fine-tune (evaluated every 500 steps) instead of the final step.')
+    p.add_argument('--freeze_logic', action='store_true',
+                   help='HONESTY CONTROL: freeze logic params at random init; train only the '
+                        'plumbing (ln_2, pool). Shape-compatible with any out_gate_mult/lut_k.')
+    p.add_argument('--mlp_guided_init', action='store_true',
+                   help='functional init: seed the first logic layer\'s candidate connections from '
+                        'the trained MLP\'s input importance (||W1[:,c]||) instead of random.')
+    p.add_argument('--grad_checkpoint', action='store_true',
+                   help='gradient-checkpoint the logic stack (recompute in backward) to cut memory '
+                        'for large LUT-K gates -> run full batch_size instead of a reduced one.')
+    p.add_argument('--weighted_pool', action='store_true',
+                   help='learned per-channel per-bit readout weights (up to 2^group_size output '
+                        'levels at NO extra gate cost; block-diagonal, not a dense out_proj). '
+                        'Init == learn_pool, so it can only help.')
+    p.add_argument('--signed_encoding', action='store_true',
+                   help='signed real->binary encoding: sign bit + pos-magnitude thermometer + '
+                        'neg-magnitude thermometer (2*n_bits+1 bits/scalar). Keeps sign+magnitude '
+                        'of zero-centered post-norm activations. Mutually exclusive with calibration.')
     p.add_argument('--identity_logic',  action='store_true',
                    help='ablation: LearnedLogicLayer returns input as output')
 
@@ -50,6 +104,42 @@ def _common_args(p):
                    help='learnable per-channel affine on sum_pool output (cheap residual-stat matching)')
     p.add_argument('--token_shift',     type=int, default=0,
                    help='Fixed causal token shift K: each position sees [x[t-K]..x[t]] (cross-token via local context). The one mechanism (with hybrid/selective) that raises accuracy.')
+    p.add_argument('--pre_conv1d', action='store_true',
+                   help='add causal Conv1D after norm/token_shift and before LGN binarization')
+    p.add_argument('--pre_conv1d_channels', type=int, default=0,
+                   help='pre-LGN Conv1D output channels (0 = token_shift width)')
+    p.add_argument('--pre_conv1d_kernel', type=int, default=3)
+    p.add_argument('--pre_conv1d_stride', type=int, default=1,
+                   help='pre-LGN Conv1D temporal stride; output is causally restored to original T')
+    p.add_argument('--pre_conv1d_groups', type=int, default=1)
+    p.add_argument('--post_conv1d', action='store_true',
+                   help='add causal Conv1D after LGN aggregation and before residual')
+    p.add_argument('--post_conv1d_channels', type=int, default=0,
+                   help='post-LGN Conv1D channels (0 = n_embd; != n_embd uses 1x1 return projection)')
+    p.add_argument('--post_conv1d_kernel', type=int, default=3)
+    p.add_argument('--post_conv1d_stride', type=int, default=1,
+                   help='post-LGN Conv1D temporal stride; output is causally restored to original T')
+    p.add_argument('--post_conv1d_groups', type=int, default=1)
+    p.add_argument('--binary_encoder', type=str, default='activation',
+                   choices=['activation', 'lloydmax'],
+                   help='real->binary encoder: historical activation thermometer or LloydMax thresholds')
+    p.add_argument('--lloyd_ema', type=float, default=0.99,
+                   help='EMA decay for LloydMax activation mean/std')
+    p.add_argument('--lloyd_min_std', type=float, default=1e-3,
+                   help='minimum std for LloydMax activation thresholds')
+    p.add_argument('--interconnect', type=str, default='random',
+                   choices=['random', 'topk_block_sparse'],
+                   help='gate input interconnect: random candidate lottery or block-sparse top-k')
+    p.add_argument('--topk_sparse_k', type=int, default=8,
+                   help='block size for --interconnect topk_block_sparse')
+    p.add_argument('--topk_sparse_scale', type=float, default=1.0,
+                   help='softmax scale for block-sparse top-k interconnect')
+    p.add_argument('--pool_curve', action='store_true',
+                   help='#2 learned per-channel nonlinear readout (count->value curve); needs sum_pool')
+    p.add_argument('--residual_scale', action='store_true',
+                   help='#4 per-channel learned alpha on the LGN contribution (x + alpha*LGN)')
+    p.add_argument('--ensemble', type=int, default=1,
+                   help='#5 within-layer gate banks averaged (variance reduction); needs depth==1')
     # RDDLGN-inspired recurrent/stateful LGN (alternative cross-token mechanism)
     p.add_argument('--recurrent',       action='store_true',
                    help='use a recurrent/stateful LGN layer (state_t = Logic([token_bits_t, state_{t-1}])). Causal; NOT full RDDLGN encoder/decoder.')
@@ -71,6 +161,8 @@ def _common_args(p):
     p.add_argument('--finetune_steps',  type=int,   default=1_000)
     p.add_argument('--eval_iters',      type=int,   default=30,
                    help='val batches used in estimate_loss (lower = faster, noisier)')
+    p.add_argument('--batch_size',      type=int,   default=32,
+                   help='training batch size (lower it for memory-heavy gates, e.g. LUT-K).')
     p.add_argument('--per_layer_anneal', action='store_true',
                    help='scale imitation steps by layer difficulty')
     p.add_argument('--ft_log_sharpness', action='store_true', default=True,
@@ -94,6 +186,19 @@ def _common_args(p):
                    help='direct training: anneal temperature during fine-tune on LM loss instead of imitation')
     p.add_argument('--ft_imit_weight',  type=float, default=0.0,
                    help='curriculum: decaying MSE-to-MLP weight blended into fine-tune (0 = pure LM)')
+    # Training dynamics knobs (defaults match TrainConfig, so omitting them = current behavior).
+    p.add_argument('--temp_start',      type=float, default=2.0,
+                   help='annealing temperature start (softer = more exploration). Default 2.0.')
+    p.add_argument('--temp_end',        type=float, default=0.1,
+                   help='annealing temperature end (sharper = smaller soft-hard gap). Default 0.1.')
+    p.add_argument('--ent_conn',        type=float, default=0.001,
+                   help='imitation: connection-softmax entropy weight (commitment pressure).')
+    p.add_argument('--ent_gate',        type=float, default=0.02,
+                   help='imitation: gate/LUT entropy weight (raise to force commitment / shrink hard gap).')
+    p.add_argument('--ft_ent_conn',     type=float, default=0.0005,
+                   help='fine-tune: connection entropy weight.')
+    p.add_argument('--ft_ent_gate',     type=float, default=0.01,
+                   help='fine-tune: gate/LUT entropy weight.')
     p.add_argument('--layers',          type=int, nargs='*', default=None,
                    help='restrict heatmap to these layer indices (default: all)')
     p.add_argument('--seed',            type=int, default=1337,
@@ -107,6 +212,25 @@ def _common_args(p):
     # misc
     p.add_argument('--results_dir',     type=str,   default='results')
     p.add_argument('--checkpoint',      type=str,   default=None)
+
+
+def _parse_layer_spec(items, flag):
+    """Parse ['0:8','11:4'] -> {0:8, 11:4} with clear errors for malformed specs."""
+    out = {}
+    for it in items or []:
+        if it.count(':') != 1:
+            raise ValueError(f"--{flag}: '{it}' must be LAYER:VALUE (one colon).")
+        ks, vs = it.split(':')
+        try:
+            k, v = int(ks), int(vs)
+        except ValueError:
+            raise ValueError(f"--{flag}: '{it}' must be int:int (e.g. 0:8).")
+        if k < 0:
+            raise ValueError(f"--{flag}: layer index '{k}' must be >= 0.")
+        if v < 1:
+            raise ValueError(f"--{flag}: value for layer {k} must be >= 1 (got {v}).")
+        out[k] = v
+    return out
 
 
 def _build_cfg(args):
@@ -123,7 +247,38 @@ def _build_cfg(args):
     cfg.logic.activation      = args.activation
     cfg.logic.conn_init_scale = args.conn_init_scale
     cfg.logic.gate_init_scale = args.gate_init_scale
-    cfg.logic.hybrid_layers   = args.hybrid_layers
+    # --hybrid_all expands to all layers. Reject mixing with explicit --hybrid_layers (ambiguous).
+    if args.hybrid_all:
+        if args.hybrid_layers:
+            raise ValueError("pass either --hybrid_all OR --hybrid_layers, not both.")
+        cfg.logic.hybrid_layers = list(range(args.n_layer))
+    else:
+        cfg.logic.hybrid_layers = args.hybrid_layers
+    cfg.logic.hybrid_ln2      = args.hybrid_ln2
+    cfg.logic.learn_binary_calibration = args.learn_binary_calibration
+    cfg.logic.signed_encoding = args.signed_encoding
+    cfg.logic.precision_layers = args.precision_layers
+    cfg.logic.high_n_bits = args.high_n_bits
+    cfg.logic.out_gate_mult = args.out_gate_mult
+    cfg.logic.out_gate_mult_layers = _parse_layer_spec(args.out_gate_mult_layers, 'out_gate_mult_layers')
+    cfg.logic.lut_k_layers = _parse_layer_spec(args.lut_k_layers, 'lut_k_layers')
+    cfg.logic.weighted_pool = args.weighted_pool
+    cfg.logic.lut_k = args.lut_k
+    cfg.logic.mlp_guided_init = args.mlp_guided_init
+    cfg.logic.freeze_logic = args.freeze_logic
+    cfg.logic.logic_residual = args.logic_residual
+    cfg.logic.gated_lut = args.gated_lut
+    cfg.train.ft_keep_best_hard = args.ft_keep_best_hard
+    if args.logic_residual and args.depth < 2:
+        raise ValueError("--logic_residual needs --depth >= 2 (it wires deeper gate layers).")
+    if args.gated_lut and args.lut_k < 2:
+        raise ValueError("--gated_lut requires --lut_k >= 2.")
+    cfg.logic.grad_checkpoint = args.grad_checkpoint
+    if args.signed_encoding and args.learn_binary_calibration:
+        raise ValueError("--signed_encoding and --learn_binary_calibration are mutually exclusive "
+                         "(signed encoding does its own real->binary mapping).")
+    if args.signed_encoding and not args.binary_io and not args.classic:
+        raise ValueError("--signed_encoding requires binary_io (it emits bits). Drop --no-binary_io.")
     cfg.logic.identity_logic  = args.identity_logic
     # Aggressive setup is the default; --classic flips back to the Linear-sandwich setup.
     if args.classic:
@@ -137,7 +292,45 @@ def _build_cfg(args):
         cfg.logic.sum_pool   = args.sum_pool
         cfg.logic.n_bits     = args.n_bits
     cfg.logic.learn_pool      = args.learn_pool
+    # width_mult only sizes the trained in_proj Linear (no_in_proj=False). Under the aggressive
+    # default (no_in_proj=True) the gate count is eff_C*bits, so width_mult is a NO-OP there.
+    if cfg.logic.no_in_proj and args.width_mult != 2:
+        print(f"[warn] --width_mult {args.width_mult} is a NO-OP under no_in_proj (aggressive); "
+              f"gate count = eff_C*bits. Use --depth / --n_bits for real capacity, or --no-no_in_proj.")
     cfg.logic.token_shift     = args.token_shift
+    cfg.logic.pre_conv1d = args.pre_conv1d
+    cfg.logic.pre_conv1d_channels = args.pre_conv1d_channels
+    cfg.logic.pre_conv1d_kernel = args.pre_conv1d_kernel
+    cfg.logic.pre_conv1d_stride = args.pre_conv1d_stride
+    cfg.logic.pre_conv1d_groups = args.pre_conv1d_groups
+    cfg.logic.post_conv1d = args.post_conv1d
+    cfg.logic.post_conv1d_channels = args.post_conv1d_channels
+    cfg.logic.post_conv1d_kernel = args.post_conv1d_kernel
+    cfg.logic.post_conv1d_stride = args.post_conv1d_stride
+    cfg.logic.post_conv1d_groups = args.post_conv1d_groups
+    cfg.logic.binary_encoder = args.binary_encoder
+    cfg.logic.lloyd_ema = args.lloyd_ema
+    cfg.logic.lloyd_min_std = args.lloyd_min_std
+    cfg.logic.interconnect = args.interconnect
+    cfg.logic.topk_sparse_k = args.topk_sparse_k
+    cfg.logic.topk_sparse_scale = args.topk_sparse_scale
+    cfg.logic.pool_curve = args.pool_curve
+    cfg.logic.residual_scale = args.residual_scale
+    cfg.logic.ensemble = args.ensemble
+    if args.pool_curve and not cfg.logic.sum_pool:
+        raise ValueError("--pool_curve requires sum_pool (it is a learned readout over the bit count).")
+    if args.ensemble < 1:
+        raise ValueError("--ensemble must be >= 1.")
+    if args.ensemble > 1 and args.depth > 1:
+        raise ValueError("--ensemble requires depth==1 (banks are parallel, not chained).")
+    if args.binary_encoder == 'lloydmax':
+        if args.signed_encoding or args.learn_binary_calibration:
+            raise ValueError("--binary_encoder lloydmax is mutually exclusive with "
+                             "--signed_encoding and --learn_binary_calibration.")
+        if not cfg.logic.binary_io:
+            raise ValueError("--binary_encoder lloydmax requires binary_io=True.")
+    if args.interconnect == 'topk_block_sparse' and args.topk_sparse_k < 1:
+        raise ValueError("--topk_sparse_k must be >= 1.")
     cfg.logic.recurrent             = args.recurrent
     cfg.logic.recurrent_layers      = args.recurrent_layers
     cfg.logic.recurrent_state_width = args.recurrent_state_width
@@ -152,6 +345,7 @@ def _build_cfg(args):
     cfg.train.imitation_steps  = args.imitation_steps
     cfg.train.finetune_steps   = args.finetune_steps
     cfg.train.eval_iters       = args.eval_iters
+    cfg.train.batch_size       = args.batch_size
     cfg.train.per_layer_anneal = args.per_layer_anneal
     cfg.train.ft_log_sharpness = args.ft_log_sharpness
     cfg.train.ft_eval_hard     = args.ft_eval_hard
@@ -163,6 +357,12 @@ def _build_cfg(args):
     cfg.train.cage_ema         = args.cage_ema
     cfg.train.anneal_in_finetune = args.anneal_in_finetune
     cfg.train.ft_imit_weight   = args.ft_imit_weight
+    cfg.train.temp_start       = args.temp_start
+    cfg.train.temp_end         = args.temp_end
+    cfg.train.ent_conn         = args.ent_conn
+    cfg.train.ent_gate         = args.ent_gate
+    cfg.train.ft_ent_conn      = args.ft_ent_conn
+    cfg.train.ft_ent_gate      = args.ft_ent_gate
     cfg.train.joint_polish_steps = args.joint_polish_steps
     cfg.train.joint_polish_kl_weight = args.joint_polish_kl_weight
     cfg.results_dir = args.results_dir

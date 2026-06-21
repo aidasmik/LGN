@@ -90,6 +90,86 @@ Patikrinau, kiek galima palikti transformer sluoksnių, paaukojant efektyvumą u
 
 ---
 
+## LGN kaip FFN pakaitalas: kur tikrosios lubos?
+
+Ankstesni rezultatai painiojo du dalykus — *cross-token* (attention) ir *per-token* (FFN)
+darbą. Kad atskirčiau, atlikau švarų eksperimentą: **užšaldau ištreniruotą attention VISUOSE
+12 sluoksnių** (ne tik L0) ir leidžiu LGN pakeisti **tik FFN/MLP** dalį. Klausimas grynas:
+*kiek gerai LGN gali imituoti FFN, kai attention idealus?*
+
+| Modelis | Accuracy % | Ką izoliuoja |
+|---|---:|---|
+| Transformeris | 54.82 | lubos |
+| Attention + LGN-FFN (visi 12) | 35.35 | grynas per-token LGN |
+| Attention + identity-LGN (vartai išjungti) | 26.46 | tik „instaliacija" (ln + pooling + residual) |
+| Tik attention (FFN pašalintas) | 5.46 | grindys — FFN vertas +49 pp |
+
+**Pirma išvada — attention nebuvo vienintelė problema.** Net su idealiu attention LGN-FFN
+pasiekia tik 35 % (atotrūkis 19.5 pp). Įdomu, kad tai *toks pat* rezultatas kaip TokenShift
+(36.2 %) — t.y. atsitrenkėme į **„LGN-kaip-FFN lubas", nepriklausomas nuo to, kaip sprendžiam
+cross-token.** Jautriausi FFN sluoksniai: **L0 ≫ L11 > L10 > L9**; vidurio FFN (L1–L6) beveik
+nemokami. Kontrolė patvirtina, kad vartai dirba realiai (ne „instaliacija"): jie prideda
++8.9 pp virš identity-LGN.
+
+### Kas yra tikrasis svertas — NE precizija, o vartų KIEKIS
+
+Hipotezė buvo, kad bottleneck'as — binarizacijos precizija. Sistemingai patikrinau ir
+**atmečiau** ją:
+
+- **Įvesties precizija nesvarbi.** `out_mult2` (8-bit įvestis) ≈ `n_bits16` (16-bit įvestis) —
+  perpus mažiau įvesties bitų, tas pats rezultatas.
+- **Skaitymo (readout) precizija nesvarbi.** `weighted_pool` (mokomi per-bitiniai svoriai →
+  iki 2^g lygių vietoj g+1, be papildomų vartų) **nieko nedavė** (35.31 % ≈ 35.35 % bazė).
+  Protingesnis tų pačių vartų nuskaitymas nepadeda.
+- **Vartų kiekis — DUODA.** Daugiau išvesties vartų kanalui: 35.4 → 38.3 → 41.8 % (vartai
+  1× → 2× → 4×).
+
+Taigi LGN-FFN atotrūkį riboja **skaičiavimo talpa (vartų kiekis)**, ne kodavimo/nuskaitymo
+precizija. Protingesnis nuskaitymas talpos nepakeičia.
+
+### Efektyvumo svertas: vartų ARITETAS (k-input LUT)
+
+Jei riba — vartų kiekis, klausimas: *ar galingesnis primityvas padaro daugiau vienam
+vartui?* 2-input vartas yra silpniausias įmanomas. Įdiegiau **k-input LUT vartą** (LUT-K:
+mokoma 2^K-įrašų lentelė per multitiesį išplėtimą; hard-snap'inasi į vieną FPGA LUT-K).
+Matavimas ant L0 (sunkiausio sluoksnio), vienodas vartų kiekis:
+
+| Primityvas | FPGA LUT | L0 degradacija |
+|---|---:|---:|
+| 2-input | 1× | 0.435 |
+| LUT3 | 1× | 0.287 |
+| LUT4 | 1× | 0.213 |
+| LUT6 | 1× | **0.156** |
+| 2-input (2× vartų) | 2× | 0.200 |
+| 2-input (4× vartų) | 4× | 0.098 |
+
+**LUT4 (1 vartas) ≈ 2-input (2 vartai); LUT6 (1 vartas) ≈ 2-input (~2.7 vartai)** — bet
+**TIK ant L0** (sunkiausio sluoksnio). LUT6 yra FPGA natūralus vienetas (Xilinx/AMD).
+
+⚠️ **Sąžininga korekcija — L0 efektas nepersikelia į visą modelį.** Kai LUT4 paleidžiu
+visuose 12 sluoksnių (švarus batch 32, gradient checkpointing dėl atminties), gaunu tik
+**36.28 %** — t.y. **+0.9 pp** virš to paties vartų kiekio 2-input bazės (35.35 %), o vartų
+*padvigubinimas* (out_mult2) duoda +3.0 pp. Priežastis: **tik keli sunkūs sluoksniai
+(L0/L10/L11) gauna naudos iš galingesnio primityvo**; vidurio FFN ir taip lengvi, tad
+vidurkis stipriai atskiedžiamas. Taigi „~2.7× efektyvumas" yra **vieno-sunkaus-sluoksnio
+potencialas, ne viso modelio daugiklis.** Aritetas — realus, bet **kuklus** (~+1 pp prie
+vienodo vartų kiekio) svertas, svarbus ten, kur sluoksnis sunkus, ne visur. Būtent tokius
+perdėjimus ir gaudo sąžiningų kontrolių disciplina.
+
+Paleidimas (visi sluoksniai hibridiniai, LUT6 vartai, gradient checkpointing dėl atminties):
+```bash
+python run.py scale --hybrid_all --hybrid_ln2 copy_trainable --learn_pool \
+  --lut_k 6 --grad_checkpoint --batch_size 16 \
+  --heatmap results/report/hybrid_all_heat/heatmap.json --checkpoint results/baseline.pt
+```
+
+**Sąžiningumo pastaba:** visi šie skaičiai laiko **pilną float attention** visuose 12
+sluoksnių, tad senas „29× mažiau FLOPs" čia nebegalioja — attention dabar dominuoja
+skaičiavimą. Šios fazės tikslas buvo *suprasti* LGN-kaip-FFN ribą (talpa, ne precizija; LUT
+aritetas kaip efektyvumo svertas), ne pasiekti naują efektyvumo rekordą.
+
+---
+
 ## Literatūra
 
 Peržvelgiau keletą naujesnių DLGN darbų:

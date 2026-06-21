@@ -275,6 +275,10 @@ def finetune_layers(logic_model, target_indices, data, cfg, trained_model=None, 
         cage_K = 16  # gate logits dimension (worst case; conn=4 also fits in [1/16, 1])
         c_ema = 1.0 / cage_K  # initial confidence = uniform
         print(f'    [CAGE enabled] tau_max={tau_max} tau_min={tau_min} ema={ema_decay}')
+    # B4: select by HARD validation -- periodically snap+eval the hard model and keep the
+    # best-hard checkpoint instead of whatever the final step happens to be.
+    keep_best = getattr(cfg, 'ft_keep_best_hard', False)
+    best_hv, best_state = float('inf'), None
     logic_model.train()
     for step in range(cfg.finetune_steps):
         if anneal:
@@ -319,6 +323,18 @@ def finetune_layers(logic_model, target_indices, data, cfg, trained_model=None, 
                 hard_val = estimate_loss(hard, data, cfg.eval_iters, cfg.batch_size)
                 print(f'      hard_val={hard_val:.4f}')
                 logic_model.train()
+        if keep_best and (step % 500 == 499 or step == cfg.finetune_steps - 1):
+            hard = make_hard_model(logic_model, target_indices, device)
+            hv = estimate_loss(hard, data, cfg.eval_iters, cfg.batch_size)
+            if hv < best_hv:
+                best_hv = hv
+                best_state = {i: copy.deepcopy(logic_model.transformer.h[i].state_dict())
+                              for i in target_indices}
+            logic_model.train()
+    if keep_best and best_state is not None:
+        for i, sd in best_state.items():
+            logic_model.transformer.h[i].load_state_dict(sd)
+        print(f'    [best-hard] restored checkpoint with hard_val={best_hv:.4f}')
     # Restore toggles so subsequent eval / joint polish doesn't get unintended noise.
     if use_ste:
         for idx in target_indices:
@@ -359,7 +375,48 @@ def _build_logic_layer(trained_default, layer_idx, gpt_cfg, logic_cfg):
         binary_io=logic_cfg.binary_io, n_bits=logic_cfg.n_bits,
         sum_pool=logic_cfg.sum_pool, no_in_proj=logic_cfg.no_in_proj,
         learn_pool=logic_cfg.learn_pool, token_shift=logic_cfg.token_shift,
+        learn_binary_calibration=getattr(logic_cfg, 'learn_binary_calibration', False),
+        signed_encoding=getattr(logic_cfg, 'signed_encoding', False),
+        out_gate_mult=getattr(logic_cfg, 'out_gate_mult', 1),
+        weighted_pool=getattr(logic_cfg, 'weighted_pool', False),
+        lut_k=getattr(logic_cfg, 'lut_k', 0),
+        grad_checkpoint=getattr(logic_cfg, 'grad_checkpoint', False),
+        logic_residual=getattr(logic_cfg, 'logic_residual', False),
+        gated_lut=getattr(logic_cfg, 'gated_lut', False),
+        pre_conv1d=getattr(logic_cfg, 'pre_conv1d', False),
+        pre_conv1d_channels=getattr(logic_cfg, 'pre_conv1d_channels', 0),
+        pre_conv1d_kernel=getattr(logic_cfg, 'pre_conv1d_kernel', 3),
+        pre_conv1d_stride=getattr(logic_cfg, 'pre_conv1d_stride', 1),
+        pre_conv1d_groups=getattr(logic_cfg, 'pre_conv1d_groups', 1),
+        post_conv1d=getattr(logic_cfg, 'post_conv1d', False),
+        post_conv1d_channels=getattr(logic_cfg, 'post_conv1d_channels', 0),
+        post_conv1d_kernel=getattr(logic_cfg, 'post_conv1d_kernel', 3),
+        post_conv1d_stride=getattr(logic_cfg, 'post_conv1d_stride', 1),
+        post_conv1d_groups=getattr(logic_cfg, 'post_conv1d_groups', 1),
+        binary_encoder=getattr(logic_cfg, 'binary_encoder', 'activation'),
+        lloyd_ema=getattr(logic_cfg, 'lloyd_ema', 0.99),
+        lloyd_min_std=getattr(logic_cfg, 'lloyd_min_std', 1e-3),
+        interconnect=getattr(logic_cfg, 'interconnect', 'random'),
+        topk_sparse_k=getattr(logic_cfg, 'topk_sparse_k', 8),
+        topk_sparse_scale=getattr(logic_cfg, 'topk_sparse_scale', 1.0),
+        residual_scale=getattr(logic_cfg, 'residual_scale', False),
+        pool_curve=getattr(logic_cfg, 'pool_curve', False),
+        ensemble=getattr(logic_cfg, 'ensemble', 1),
     )
+    # Per-layer adaptive precision: sensitive layers get more bits (degradation ~1/n_bits).
+    if layer_idx in getattr(logic_cfg, 'precision_layers', []):
+        common['n_bits'] = logic_cfg.high_n_bits
+        print(f'  [precision] L{layer_idx} uses n_bits={logic_cfg.high_n_bits} (sensitive layer)')
+    # Per-layer output capacity / gate arity overrides (unlisted layers keep the global value).
+    ogm_layers = getattr(logic_cfg, 'out_gate_mult_layers', None) or {}
+    if layer_idx in ogm_layers:
+        common['out_gate_mult'] = ogm_layers[layer_idx]
+    lutk_layers = getattr(logic_cfg, 'lut_k_layers', None) or {}
+    if layer_idx in lutk_layers:
+        common['lut_k'] = lutk_layers[layer_idx]
+    if common.get('out_gate_mult', 1) != 1 or common.get('lut_k', 0) >= 2:
+        print(f'  [capacity] L{layer_idx}: out_gate_mult={common.get("out_gate_mult",1)} '
+              f'lut_k={common.get("lut_k",0)}')
     # Recurrent layer: enabled when --recurrent and (no recurrent_layers list, or this idx in it).
     rec = getattr(logic_cfg, 'recurrent', False)
     rec_idx = getattr(logic_cfg, 'recurrent_layers', []) or []
@@ -389,10 +446,20 @@ def _build_logic_layer(trained_default, layer_idx, gpt_cfg, logic_cfg):
             state_init=logic_cfg.recurrent_state_init,
         )
     if layer_idx in logic_cfg.hybrid_layers:
-        print(f'  [hybrid] keeping original attention sublayer for L{layer_idx}, logic replaces MLP only')
-        return HybridLogicGateGPTLayer(
-            gpt_cfg, layer_idx, trained_default.transformer.h[layer_idx], **common)
-    return LogicGateGPTLayer(gpt_cfg, layer_idx, **common)
+        ln2_mode = getattr(logic_cfg, 'hybrid_ln2', 'fresh')
+        print(f'  [hybrid] keeping original attention sublayer for L{layer_idx}, logic replaces MLP only '
+              f'(ln2={ln2_mode})')
+        layer = HybridLogicGateGPTLayer(
+            gpt_cfg, layer_idx, trained_default.transformer.h[layer_idx],
+            ln2_mode=ln2_mode, mlp_guided_init=getattr(logic_cfg, 'mlp_guided_init', False),
+            **common)
+    else:
+        layer = LogicGateGPTLayer(gpt_cfg, layer_idx, **common)
+    # Honesty control: random frozen gates, trainable plumbing (see LogicConfig.freeze_logic).
+    layer.freeze_logic = getattr(logic_cfg, 'freeze_logic', False)
+    if layer.freeze_logic:
+        print(f'  [control] L{layer_idx}: logic FROZEN at random init (plumbing-only training)')
+    return layer
 
 
 def _make_logic_model(trained_default, layer_idx, gpt_cfg, logic_cfg, device):
@@ -475,13 +542,17 @@ def _enable_lgn_grads(layer):
     baseline), but the surrounding pipeline used to re-enable ALL params via
     `for p in layer.parameters(): p.requires_grad = True`. That silently re-trained
     the attention sublayer, defeating the "keep original attention" intent.
-    Now: skip attn.* and ln_1.* names for hybrid layers; standard layers unchanged."""
+    Now: skip attn.* and ln_1.* names for hybrid layers; standard layers unchanged.
+    Also keep ln_2.* frozen when the hybrid layer copied it frozen (hybrid_ln2=copy_frozen),
+    so the 'only the MLP function changes' ablation isn't silently retrained."""
     is_hybrid = isinstance(layer, HybridLogicGateGPTLayer)
+    freeze_ln2 = is_hybrid and getattr(layer, 'ln2_mode', 'fresh') == 'copy_frozen'
+    freeze_logic = getattr(layer, 'freeze_logic', False)   # honesty control: random frozen gates
     for name, p in layer.named_parameters():
-        if is_hybrid and (name.startswith('attn.') or name.startswith('ln_1.')):
-            p.requires_grad = False
-        else:
-            p.requires_grad = True
+        frozen = is_hybrid and (name.startswith('attn.') or name.startswith('ln_1.'))
+        frozen = frozen or (freeze_ln2 and name.startswith('ln_2.'))
+        frozen = frozen or (freeze_logic and name.startswith('logic.'))
+        p.requires_grad = not frozen
 
 
 def _logic_indices(model):
