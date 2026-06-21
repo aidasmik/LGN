@@ -26,29 +26,63 @@ LloydMax, TopK ir kt.) nedavė nieko, ir žemiau paaiškinu kodėl.
 
 ---
 
-## Ką pasiekėme: LGN kaip FFN pakaitalas
+## Kaip optimizavau patį LGN
 
 Kad atskirčiau *cross-token* (attention) ir *per-token* (FFN) darbą, padariau švarų
 eksperimentą: užšaldau ištreniruotą attention visuose 12 sluoksnių ir leidžiu LGN pakeisti
 **tik FFN**. Klausimas grynas — *kiek gerai LGN imituoja FFN, kai attention idealus?* Bazinis
 variantas duoda 35.4 %, ir nuo čia ieškojau, kas šį skaičių realiai kelia.
 
+### Kaip LGN keičia FFN
+
+Kad būtų aišku, ką optimizuoju — LGN gauna sluoksnio aktyvaciją (128 kanalų float vektorių),
+ją binarizuoja, paleidžia per loginių vartų stack'ą ir nuskaito atgal į 128 float kanalus:
+
+1. **Binarizacija (įvestis).** Kiekvienas kanalas suspaudžiamas (sigmoid) ir paverčiamas į
+   `n_bits` bitų termometru → 128 × n_bits įvesties bitų. Gradientui — STE (straight-through).
+2. **Vartai.** Kiekvienas išvesties vartas išsirenka iš `k` kandidatinių įvesties laidų
+   (softmax) ir vieną iš 16 Boolean funkcijų (irgi softmax). Soft treniruojant = svertinis
+   mišinys; hard inference = argmax (viena laidų pora + viena funkcija). 2-input vartas:
+   `g(A,B)=c0+c1A+c2B+c3AB`.
+3. **Nuskaitymas (readout).** Išvesties vartai grupuojami po kanalą, `sum_pool` suskaičiuoja
+   vienetukus grupėje → vienas skaičius kanalui. Būtent čia ir slypi pagrindinis talpos svertas.
+
+### Diagnozė: talpa, ne precizija
+
 Pirmas dalykas, kurį teko atmesti — preciziją. Galvojau, kad bottleneck'as yra binarizacijos
-tikslumas, bet ne: 8-bit įvestis ≈ 16-bit, o protingesnis nuskaitymas (`weighted_pool`) nedavė
-nieko. **Atotrūkį riboja skaičiavimo talpa — vartų kiekis ir galia — o ne kodavimas.** Štai
-kas tikrai veikia:
+tikslumas, bet ne: 8-bit įvestis ≈ 16-bit (perpus mažiau įvesties bitų, tas pats rezultatas),
+o protingesnis nuskaitymas (`weighted_pool`, iki 2^g lygių vietoj g+1) nedavė nieko. Išvada:
+**atotrūkį riboja skaičiavimo talpa — vartų kiekis ir galia — o ne kaip tiksliai užkoduoju ar
+perskaitau.** Visa likusi optimizacija nuo to ir atsispiria.
+
+### Talpos svertai (stipriausi)
 
 ![what moves the metric](results/figs/report/fig2_levers.png)
 
-| Svertas | Efektas | Tipas |
+| Svertas | Ką daro | Efektas |
 |---|---|---|
-| **out_gate_mult** (daugiau išvesties vartų) | 35.4 → 38.3 → **41.8 %** (1×→2×→4×) | talpa (stipriausias) |
-| **LUT-K aritetas** (k-input vartas vietoj 2-input) | +0.9 pp prie vienodo vartų kiekio | vartų galia |
-| **CAGE / STE** (hard-forward) | uždaro soft–hard gap'ą | treniravimas |
-| **Best-hard checkpoint** | +0.8 pp | treniravimas |
-| **KL distiliacija** iš transformerio | +0.5 pp | treniravimas |
+| **out_gate_mult** | daugiau išvesties vartų kanalui → didesnė readout rezoliucija (sum_pool grupė platesnė) | 35.4 → 38.3 → **41.8 %** (1×→2×→4×) |
+| **LUT-K aritetas** | 2-input vartą (silpniausias primityvas) keičia k-input LUT: mokoma 2^K-įrašų lentelė per multitiesį išplėtimą, hard'e = vienas FPGA LUT-K | +0.9 pp prie *vienodo* vartų kiekio |
+| **Selektyvi talpa** | papildomus vartus deda tik į sunkius sluoksnius (L0/L9/L10/L11), ne tolygiai | talpa eina ten, kur reikia |
 
-Sudėjus šiuos svertus (out_gate_mult 8 + k16 + LUT4 + CAGE + best-hard + KL) bazinis 35.4 %
+### Treniravimo svertai (be papildomų vartų)
+
+| Svertas | Ką daro | Efektas |
+|---|---|---|
+| **CAGE / STE** | forward kietas (argmax, lygiai kaip inference), backward minkštas su adaptyvia temperatūra → soft–hard gap'as principe dingsta | uždaro gap'ą |
+| **Best-hard checkpoint** | renka geriausią pagal *hard* val (tai, kas svarbu inference), ne pagal soft | +0.8 pp |
+| **KL distiliacija** | mokosi atkartoti viso transformerio išvesties skirstinį, ne tik teisingą byte'ą | +0.5 pp |
+
+### Kaip viskas suvedama (pipeline)
+
+1. **Imitation** — kiekvienam sluoksniui pirma treniruoju LGN, kad MSE prasme atkartotų
+   originalaus FFN išvestį (šiltas startas).
+2. **Fine-tune** — tada derinu su LM loss (+ KL), CAGE/STE ir best-hard atranka; temperatūrą
+   per fine-tune anneal'inu soft → hard.
+3. **Greedy scaling** — keičiu sluoksnius po vieną, **lengviausią pirma** (pagal sunkumo
+   heatmap'ą), kad likęs tinklas spėtų prisitaikyti prie kiekvieno naujo LGN sluoksnio.
+
+Sudėjus visus svertus (out_gate_mult 8 + k16 + LUT4 + CAGE + best-hard + KL) bazinis 35.4 %
 pakyla iki **48.2 %**.
 
 ### Ablation testas: ar vartai išvis ką nors daro?
