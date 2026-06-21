@@ -68,8 +68,7 @@ def fig_headline():
     ax.text(2, pure / 2, f'{pure/pure_tf*100:.0f}% of\ntransformer', ha='center', va='center',
             color='white', fontweight='bold', fontsize=10)
     ax.set_ylabel('Next-byte top-1 accuracy (%)')
-    ax.set_title('LGN as an FFN replacement vs the transformer ceiling\n'
-                 'byte-level WikiText-2, hard (discretized) LGN', fontsize=12)
+    ax.set_title('LGN as an FFN replacement', fontsize=13)
     ax.set_ylim(0, 60)
     ax.spines[['top', 'right']].set_visible(False)
     fig.tight_layout(); fig.savefig(f'{FIG}/fig1_headline.png', dpi=150); plt.close(fig)
@@ -108,7 +107,7 @@ def fig_levers():
         ax.text(v + 0.15, i, f'{v:.1f}', va='center', fontsize=9)
     from matplotlib.patches import Patch
     ax.set_xlabel('Hard accuracy (%) — single technique added to base LGN-FFN')
-    ax.set_title('Which levers actually move LGN-as-FFN', fontsize=12)
+    ax.set_title('Which levers move LGN-as-FFN', fontsize=13)
     ax.set_xlim(base - 3, best + 2)
     ax.legend(handles=[Patch(color=C_GOOD, label='real capacity/training lever'),
                        Patch(color=C_NEU, label='no real gain')],
@@ -142,7 +141,7 @@ def fig_honesty():
     ax.axhline(tf, color=C_TF, ls='--', lw=1, alpha=0.5)
     ax.text(0, tf + 0.4, f'transformer ceiling {tf:.1f}%', color=C_TF, fontsize=9)
     ax.set_ylabel('Hard accuracy (%)')
-    ax.set_title('Honesty control: the gates do real work, not the plumbing', fontsize=12)
+    ax.set_title('Honesty control', fontsize=13)
     ax.set_ylim(0, 60)
     ax.spines[['top', 'right']].set_visible(False)
     fig.tight_layout(); fig.savefig(f'{FIG}/fig3_honesty.png', dpi=150); plt.close(fig)
@@ -157,7 +156,7 @@ def fig_screen():
     ref = hdeg('reference')
     rows = [
         ('residual_scale (#4)',      hdeg('residual_scale', 'readout_l0')),
-        ('ensemble2 (#5, noise*)',   hdeg('ensemble2', 'readout_l0')),
+        ('ensemble2 (#5, noise)',    hdeg('ensemble2', 'readout_l0')),
         ('conv post s1',             hdeg('post_s1_c128', 'conv_l0_variants')),
         ('LloydMax encoder',         hdeg('lloydmax')),
         ('conv pre s1',              hdeg('pre_s1_c128', 'conv_l0_variants')),
@@ -176,11 +175,8 @@ def fig_screen():
     ax.text(ref, len(rows) - 0.2, f' reference {ref:.3f}', color=C_REF, fontsize=9, va='top')
     for i, v in enumerate(vals):
         ax.text(v + 0.01, i, f'{v:.3f}', va='center', fontsize=8.5)
-    ax.text(0.99, -0.13, '* ensemble2 dips below ref only at seed 1337; the edge flips sign at '
-            'seed 7 (see fig 5)', transform=ax.transAxes, ha='right', fontsize=8, color=C_REF)
     ax.set_xlabel('L0 hard_degradation (val-loss increase vs transformer FFN, lower = better)')
-    ax.set_title('Screened ideas vs the optimized reference — none reliably wins\n'
-                 '(grey = neutral, red = worse)', fontsize=11)
+    ax.set_title('Screened ideas vs reference', fontsize=13)
     ax.spines[['top', 'right']].set_visible(False)
     fig.tight_layout(); fig.savefig(f'{FIG}/fig4_screen.png', dpi=150); plt.close(fig)
     print('fig4_screen.png  ref=%.4f' % ref, [(l, round(v, 4)) for l, v in rows])
@@ -204,9 +200,7 @@ def fig_ensemble_noise():
     ax.set_xticks(x); ax.set_xticklabels(['seed 1337', 'seed 7'])
     ax.set_ylabel('L0 hard_degradation (lower=better)')
     d1, d7 = e1 - ref1, e7 - ref7
-    ax.set_title(f'Ensemble "win" is within the noise floor\n'
-                 f'edge = {d1:+.3f} (seed 1337) but {d7:+.3f} (seed 7) — sign flips',
-                 fontsize=11)
+    ax.set_title('Ensemble win is within the noise floor', fontsize=13)
     ax.legend(frameon=False)
     ax.set_ylim(0, max(ref1, ref7, e1, e7) * 1.18)
     ax.spines[['top', 'right']].set_visible(False)
@@ -230,9 +224,7 @@ def fig_per_layer():
         ax.text(b.get_x() + b.get_width() / 2, v + (0.012 if v >= 0 else -0.012),
                 f'{v:+.2f}', ha='center', va='bottom' if v >= 0 else 'top', fontsize=8.5)
     ax.set_ylabel('hard_degradation when this layer alone is LGN (lower = easier)')
-    ax.set_title('Per-layer FFN replacement difficulty\n'
-                 'L0 is by far the hardest; middle layers are near-redundant (negative); '
-                 'late layers climb back up', fontsize=11)
+    ax.set_title('Per-layer replacement difficulty', fontsize=13)
     ax.set_ylim(min(deg) - 0.05, max(deg) + 0.07)
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(color=C_GOOD, label='easier than FFN (replacing helps)'),
