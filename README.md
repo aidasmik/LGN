@@ -19,13 +19,13 @@ Projektas tiria, kiek transformerio (nanoGPT) galima pakeisti diferencijuojamais
 
 ## LGN optimizacija
 
-Trumpai, kaip LGN keičia FFN: gaunama kanalo aktyvacija, ji binarizuojama (kiekvienas iš 128 kanalų suspaudžiamas sigmoid'u ir paverčiamas `n_bits` thermometer bitais), paleidžiama per learned gates stack'ą, o output gates per kanalą sugrupuojami ir su sum_pool nuskaitomi atgal į float (suskaičiuojami vienetukai grupėje). Klausimas - kur šitame kelyje sėdi bottleneck.
+Trumpai, kaip LGN keičia FFN: gaunama kanalo aktyvacija, ji binarizuojama (kiekvienas iš 128 kanalų suspaudžiamas sigmoid'u ir paverčiamas `n_bits` thermometer bitais), paleidžiama per learned gates stack'ą, o output gates per kanalą sugrupuojami ir su sum_pool nuskaitomi atgal į float. Klausimas - kur šitame kelyje sėdi bottleneck.
 
-Pirma atmesta **precision**. Prielaida buvo, kad riboja binarizacijos tikslumas, bet ne: 8-bit įvestis duoda tą patį kaip 16-bit (perpus mažiau bitų, tas pats acc), o weighted_pool (mokami per-bitiniai readout svoriai) nepridėjo nieko. Riba - gryna **capacity** (kiek gates ir kokie galingi), ne kodavimas.
+Pirma atmesta **precision**. Prielaida buvo, kad riboja binarizacijos tikslumas, bet ne: 8-bit įvestis duoda tą patį kaip 16-bit, o weighted_pool (mokami per-bitiniai readout svoriai) nepridėjo nieko. Riba - gryna **capacity** (kiek gates ir kokie galingi), ne kodavimas.
 
 ![kas labiausiai padeda](results/figs/report/fig2_levers.png)
 
-Daugiausiai padeda **gate count output'e**. sum_pool nuskaito grupę gates į vieną skaičių, tad daugiau gates grupėje reiškia daugiau galimų lygių kanalui (didesnė readout rezoliucija). Vien tai duoda 35.4 -> 38.3 -> 41.8% (1x -> 2x -> 4x). Capacity dedama netolygiai: globaliai 4x, o sunkiausiems sluoksniams (L0, L9, L10, L11) 8x.
+Daugiausiai padeda **gate count output'e**. sum_pool nuskaito grupę gates į vieną skaičių, tad daugiau gates grupėje reiškia daugiau galimų lygių kanalui. Vien tai duoda 35.4 -> 38.3 -> 41.8% (1x -> 2x -> 4x). Capacity dedama netolygiai: globaliai 4x, o sunkiausiems sluoksniams (L0, L9, L10, L11) 8x.
 
 Kitas dalykas - **gate arity (LUT-K)**. 2-input gate yra silpniausias įmanomas vartas (16 funkcijų iš dviejų bitų). Vietoj jo naudojamas k-input LUT gate: mokoma 2^K-įrašų truth table, soft treniruojant įvertinama per multilinear extension, hard'e snap'inasi į vieną FPGA LUT-K. Ant L0 LUT4 prilygsta maždaug 2x daugiau 2-input gates, LUT6 maždaug 2.7x; visame modelyje efektas kuklesnis (apie +0.9 pp), nes nauda susikoncentruoja sunkiuose sluoksniuose.
 
@@ -87,4 +87,4 @@ Grynas LGN (be attention) gerokai efektyvesnis - pure LGN variantas pasiekia 80%
 
 ## Apibendrinimas
 
-Liko maždaug 20% gap'as tarp transformerio ir LGN, kurio paprastais architektūros priedais užpildyti nepavyko - jis atrodo fundamentalus (kvantuota sparse logika vs dense float FFN). Kita vertus, 20% skirtumas su maždaug 2.5x mažiau parametrų nėra blogas rezultatas. Didžiausias šuolis greičiausiai būtų RDDLGN kryptyje (stateful gates vietoj attention), bet tai jau didelis architektūros pertvarkymas.
+Liko maždaug 20% gap'as tarp transformerio ir LGN, kurio paprastais architektūros priedais užpildyti nepavyko - jis atrodo fundamentalus (kvantuota sparse logika vs dense float FFN). Kita vertus, 20% skirtumas su maždaug 2.5x mažiau parametrų nėra blogas rezultatas.
